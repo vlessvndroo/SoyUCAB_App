@@ -243,40 +243,27 @@ def create_post():
 def delete_post(id_pub):
     if 'user_id' not in session: return redirect(url_for('login'))
     
-    conn = get_db_connection() # Usamos conexión genérica para checkear roles
+    # Usamos la conexión con RLS activado (Rol Usuario Común)
+    conn = get_db_connection_with_role()
     cur = conn.cursor()
     
-    # ¿Es Admin?
-    es_admin = (session.get('db_role') == 'rol_admin_dba')
-    
-    # ¿Es Dueño?
-    cur.execute("SELECT 1 FROM Publica WHERE id_publicacion = %s AND id_ente = %s", (id_pub, session['user_id']))
-    es_dueno = cur.fetchone() is not None
-    
-    if es_admin or es_dueno:
-        # Si es Admin, necesitamos conectar con rol Admin para tener permiso de borrar cualquier cosa
-        if es_admin:
-            conn_admin = get_db_connection_with_role()
-            cur_admin = conn_admin.cursor()
-            try:
-                cur_admin.execute("DELETE FROM Publica WHERE id_publicacion = %s", (id_pub,))
-                cur_admin.execute("DELETE FROM Publicacion WHERE id_publicacion = %s", (id_pub,))
-                conn_admin.commit()
-                flash("Contenido eliminado por administración." if es_admin else "Post eliminado.")
-            except Exception as e:
-                conn_admin.rollback()
-                print(f"Error Admin Delete: {e}")
-            finally:
-                cur_admin.close(); conn_admin.close()
-        else:
-            # Lógica normal de usuario (RLS activado)
-            # ... (Tu lógica original con RLS) ...
-            # Para simplificar, usaremos la conexión admin para ambos casos de borrado si la lógica original falla
-            pass 
-            # (NOTA: Como ya tienes tu lógica de borrado arriba, mantenla, pero agrega el "OR es_admin")
-
-    cur.close(); conn.close()
-    return redirect(request.referrer or url_for('home'))
+    try:
+        # TRUCO: Solo borramos el Padre (Publicacion). 
+        # PostgreSQL borrará automáticamente los hijos (Publica, Comentarios, Likes).
+        cur.execute("DELETE FROM Publicacion WHERE id_publicacion = %s", (id_pub,))
+        conn.commit()
+        flash("Post eliminado.")
+        
+    except Exception as e:
+        conn.rollback()
+        print(f"Error borrando: {e}") # Mira la terminal si falla
+        flash("No se pudo eliminar.")
+        
+    finally:
+        cur.close()
+        conn.close()
+        
+    return redirect(url_for('home'))
 
 @app.route('/add_comment', methods=['POST'])
 def add_comment():

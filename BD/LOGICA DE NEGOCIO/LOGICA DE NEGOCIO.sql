@@ -87,3 +87,21 @@ WITH RECURSIVE Camino AS (
 )
 SELECT ruta FROM Camino WHERE id_amigo = id_destino ORDER BY grado ASC LIMIT 1;
 $$ LANGUAGE sql;
+
+/* --------------------------------------------------------------
+   [NUEVO] Procedimiento para eliminar posts de forma segura
+   -------------------------------------------------------------- */
+CREATE OR REPLACE PROCEDURE sp_eliminar_publicacion(p_id_publicacion INT, p_id_usuario INT, p_es_admin BOOLEAN)
+LANGUAGE plpgsql
+SECURITY DEFINER -- Ejecuta con permisos de Admin para saltar el RLS
+AS $$
+BEGIN
+    -- 1. Verificación de Seguridad Interna
+    IF p_es_admin OR EXISTS (SELECT 1 FROM Publica WHERE id_publicacion = p_id_publicacion AND id_ente = p_id_usuario) THEN
+        -- 2. Ejecutar el Borrado (El ON DELETE CASCADE limpiará los hijos)
+        DELETE FROM Publicacion WHERE id_publicacion = p_id_publicacion;
+    ELSE
+        RAISE EXCEPTION 'Acceso denegado: No eres el autor de esta publicación.';
+    END IF;
+END;
+$$;

@@ -58,6 +58,8 @@ GRANT USAGE ON SCHEMA public TO rol_usuario_comun, rol_institucional, rol_audito
 -- A) ROL USUARIO COMÚN
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO rol_usuario_comun;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO rol_usuario_comun;
+-- Permiso para usar el procedimiento de borrado seguro
+GRANT EXECUTE ON PROCEDURE sp_eliminar_publicacion(INT, INT, BOOLEAN) TO rol_usuario_comun, rol_institucional, rol_admin_dba;
 -- Permisos de Escritura
 GRANT INSERT ON Ente, Persona, Nexo_Institucional, Forma_Parte_De TO rol_usuario_comun;
 GRANT UPDATE (nombre, apellido, ocupacion) ON Persona TO rol_usuario_comun;
@@ -158,3 +160,23 @@ CREATE POLICY policy_institucional_select ON Evento FOR SELECT TO rol_institucio
     );
 CREATE POLICY policy_institucional_modificar ON Evento FOR UPDATE TO rol_institucional USING (id_evento IN (SELECT id_evento FROM Organizador_Evento WHERE id_ente = current_setting('app.current_ente_id', true)::INT));
 CREATE POLICY policy_institucional_borrar ON Evento FOR DELETE TO rol_institucional USING (id_evento IN (SELECT id_evento FROM Organizador_Evento WHERE id_ente = current_setting('app.current_ente_id', true)::INT));
+
+-- 1. Eliminar restricciones viejas (Candados)
+ALTER TABLE Publica DROP CONSTRAINT IF EXISTS fk_publica_pub;
+ALTER TABLE Comentario DROP CONSTRAINT IF EXISTS fk_com_pub;
+ALTER TABLE Reaccion DROP CONSTRAINT IF EXISTS fk_reaccion_pub;
+
+-- 2. Crear restricciones nuevas con "Modo Demolición" (ON DELETE CASCADE)
+-- Esto permite que al borrar la Publicación, se borre todo lo de adentro automáticamente.
+
+ALTER TABLE Publica
+    ADD CONSTRAINT fk_publica_pub FOREIGN KEY (id_publicacion)
+    REFERENCES Publicacion(id_publicacion) ON DELETE CASCADE;
+
+ALTER TABLE Comentario
+    ADD CONSTRAINT fk_com_pub FOREIGN KEY (id_publicacion)
+    REFERENCES Publicacion(id_publicacion) ON DELETE CASCADE;
+
+ALTER TABLE Reaccion
+    ADD CONSTRAINT fk_reaccion_pub FOREIGN KEY (id_publicacion)
+    REFERENCES Publicacion(id_publicacion) ON DELETE CASCADE;
