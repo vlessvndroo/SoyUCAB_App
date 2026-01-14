@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Grupos - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="fw-bold mb-0">Comunidades</h2>
+        <form class="d-flex" method="GET" action="/grupos">
+            <input class="form-control me-2" type="search" name="q" placeholder="Buscar grupos..." value="{{ q }}">
+            <button class="btn btn-outline-primary" type="submit">Buscar</button>
+        </form>
+    </div>
+    
+    <div class="row">
+        {% for g in grupos %}
+        <div class="col-md-4 mb-4">
+            <div class="card shadow-sm border-0 h-100">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between">
+                        <span class="badge bg-info-subtle text-info mb-2">{{ g[2]|format_tipo }}</span>
+                        <span class="text-muted small"><i class="bi bi-people"></i> {{ g[4] }}</span>
+                    </div>
+                    <h5 class="card-title fw-bold">{{ g[1] }}</h5>
+                    
+                    {% if g[3] %}
+                        <div class="d-grid gap-2">
+                            <button class="btn btn-sm btn-success disabled">Eres Miembro</button>
+                            <a href="/leave_group/{{ g[0] }}" class="btn btn-sm btn-outline-danger">Salir</a>
+                        </div>
+                    {% else %}
+                        <a href="/join_group/{{ g[0] }}" class="btn btn-sm btn-outline-primary w-100">Unirse</a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+        {% else %}
+        <div class="col-12"><div class="alert alert-warning">No se encontraron grupos.</div></div>
+        {% endfor %}
+    </div>
+</div>
+{% endblock %}

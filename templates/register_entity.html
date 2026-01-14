@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block title %}Registro Institucional - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-5 mb-5">
+    <div class="row justify-content-center">
+        <div class="col-md-8">
+            <div class="card shadow border-0">
+                <div class="card-header bg-dark text-white text-center py-4">
+                    <h3 class="fw-bold mb-0">Registro Institucional</h3>
+                    <p class="mb-0 small opacity-75">Para Escuelas, Facultades y Organizaciones Aliadas</p>
+                </div>
+                <div class="card-body p-5">
+
+                    {% with messages = get_flashed_messages() %}
+                        {% if messages %}<div class="alert alert-warning">{{ messages[0] }}</div>{% endif %}
+                    {% endwith %}
+
+                    <form action="/register_entity" method="POST">
+                        
+                        <div class="mb-4 text-center">
+                            <label class="form-label fw-bold d-block">¿Qué tipo de entidad deseas registrar?</label>
+                            <div class="btn-group" role="group">
+                                <input type="radio" class="btn-check" name="tipo_ente" id="opt_dep" value="Dependencia" checked onclick="toggleForm('dep')">
+                                <label class="btn btn-outline-primary" for="opt_dep">Dependencia UCAB</label>
+
+                                <input type="radio" class="btn-check" name="tipo_ente" id="opt_org" value="Organizacion" onclick="toggleForm('org')">
+                                <label class="btn btn-outline-primary" for="opt_org">Organización Externa</label>
+                            </div>
+                        </div>
+
+                        <h6 class="text-primary border-bottom pb-2 mb-3">Datos de Acceso</h6>
+                        <div class="row g-3 mb-3">
+                            <div class="col-md-6">
+                                <label class="form-label fw-bold">Correo Institucional</label>
+                                <input type="email" name="email" class="form-control" placeholder="ej: ingenieria@ucab.edu.ve" required>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label fw-bold">Contraseña</label>
+                                <input type="password" name="password" class="form-control" placeholder="******" required>
+                            </div>
+                        </div>
+
+                        <div id="form_dependencia">
+                            <h6 class="text-primary border-bottom pb-2 mb-3 mt-4">Datos de la Dependencia</h6>
+                            <div class="mb-3">
+                                <label class="form-label fw-bold">Nombre Oficial</label>
+                                <input type="text" name="nombre" class="form-control" placeholder="Ej: Escuela de Ingeniería Informática">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label fw-bold">Tipo</label>
+                                <select name="tipo_dep" class="form-select">
+                                    <option value="Escuela">Escuela</option>
+                                    <option value="Facultad">Facultad</option>
+                                    <option value="CentroInvestigacion">Centro de Investigación</option>
+                                    <option value="Agrupacion">Agrupación Estudiantil</option>
+                                    <option value="Secretariado">Secretariado</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div id="form_organizacion" style="display: none;">
+                            <h6 class="text-primary border-bottom pb-2 mb-3 mt-4">Datos de la Organización</h6>
+                            <div class="row g-3 mb-3">
+                                <div class="col-md-8">
+                                    <label class="form-label fw-bold">Razón Social</label>
+                                    <input type="text" id="input_nombre_org" name="nombre" class="form-control" placeholder="Ej: Empresas Polar C.A." disabled>
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label fw-bold">RIF</label>
+                                    <input type="text" name="rif" class="form-control" placeholder="J-12345678-9">
+                                </div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label fw-bold">Tipo</label>
+                                <select name="tipo_org" class="form-select">
+                                    <option value="Empresa">Empresa</option>
+                                    <option value="Fundacion">Fundación</option>
+                                    <option value="Asociacion">Asociación Civil</option>
+                                    <option value="Catedra">Cátedra Empresarial</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <h6 class="text-primary border-bottom pb-2 mb-3 mt-4">Ubicación</h6>
+                        <div class="row g-3 mb-3">
+                            <div class="col-md-4">
+                                <input type="text" name="pais" class="form-control" placeholder="País" value="Venezuela" required>
+                            </div>
+                            <div class="col-md-4">
+                                <input type="text" name="estado" class="form-control" placeholder="Estado" required>
+                            </div>
+                            <div class="col-md-4">
+                                <input type="text" name="ciudad" class="form-control" placeholder="Ciudad" required>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <textarea name="direccion" class="form-control" rows="2" placeholder="Dirección detallada (Edificio, Piso, Oficina)..." required></textarea>
+                        </div>
+                        <div class="mb-4">
+                            <label class="form-label fw-bold">Descripción / Misión</label>
+                            <textarea name="descripcion" class="form-control" rows="3" placeholder="Breve descripción de la entidad..."></textarea>
+                        </div>
+
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-dark btn-lg fw-bold">CREAR CUENTA INSTITUCIONAL</button>
+                        </div>
+                    </form>
+
+                </div>
+            </div>
+            <div class="text-center mt-3">
+                <a href="/login" class="text-decoration-none">Volver al Login</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    function toggleForm(tipo) {
+        const fDep = document.getElementById('form_dependencia');
+        const fOrg = document.getElementById('form_organizacion');
+        const inputNombreDep = document.querySelector('#form_dependencia input[name="nombre"]');
+        const inputNombreOrg = document.getElementById('input_nombre_org');
+
+        if (tipo === 'dep') {
+            fDep.style.display = 'block';
+            fOrg.style.display = 'none';
+            inputNombreDep.disabled = false;
+            inputNombreOrg.disabled = true; // Deshabilitar para evitar conflicto de nombres
+        } else {
+            fDep.style.display = 'none';
+            fOrg.style.display = 'block';
+            inputNombreDep.disabled = true; 
+            inputNombreOrg.disabled = false;
+        }
+    }
+</script>
+{% endblock %}

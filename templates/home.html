@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container">
+    <div class="row">
+        <div class="col-md-3 d-none d-md-block">
+            <div class="card shadow-sm border-0 p-4 text-center">
+                <div class="bg-secondary rounded-circle mx-auto mb-3 d-flex justify-content-center align-items-center text-white fw-bold" style="width: 80px; height: 80px; font-size: 2rem;">{{ user_name[0] }}</div>
+                <h5 class="fw-bold mb-0 text-dark">{{ user_name }}</h5>
+                <p class="text-muted small mb-3">{{ session['user_email'] }}</p>
+                <div class="d-grid gap-2">
+                    <a href="/perfil" class="btn btn-primary btn-sm">Mi Perfil</a>
+                    <a href="/perfil" class="btn btn-outline-secondary btn-sm">Configuración</a>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-6">
+            <div class="card shadow-sm mb-4 border-0">
+                <div class="card-body">
+                    <form action="/create_post" method="POST">
+                        <textarea name="contenido" class="form-control border-0 bg-light mb-2" rows="2" placeholder="Comparte algo con la comunidad..." required></textarea>
+                        <div class="d-flex justify-content-between">
+                            <div class="d-flex gap-1">
+                                <select name="tipo" class="form-select form-select-sm w-auto border-0 bg-light">
+                                    <option value="mensaje">💬 Mensaje</option>
+                                    <option value="oferta">💰 Oferta</option>
+                                    <option value="anuncio">📢 Anuncio</option>
+                                </select>
+                                <select name="visibilidad" class="form-select form-select-sm w-auto border-0 bg-light text-primary fw-bold"><option value="publica">🌐 Público</option><option value="solo-amigos">👥 Amigos</option><option value="privada">🔒 Solo yo</option></select>
+                            </div>
+                            <button type="submit" class="btn btn-primary btn-sm rounded-pill px-4">Publicar</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            {% for post in posts %}
+            <div class="card shadow-sm mb-3 border-0">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-start">
+                        <div class="d-flex align-items-center mb-3">
+                            <div class="bg-primary rounded-circle text-white d-flex justify-content-center align-items-center me-2 fw-bold" style="width: 40px; height: 40px;">{{ post.autor[0] }}</div>
+                            <div>
+                                <h6 class="mb-0 fw-bold">{{ post.autor }}</h6>
+                                <small class="text-muted">{{ post.tipo|format_tipo }} • {{ post.fecha.strftime('%d/%m/%Y') }}</small>
+                            </div>
+                        </div>
+                        {% if post.es_mio %}
+                            <a href="/delete_post/{{ post.id }}" class="text-danger" title="Eliminar" onclick="return confirm('¿Borrar post?')"><i class="bi bi-trash"></i></a>
+                        {% endif %}
+                    </div>
+                    
+                    <p class="mb-3 text-dark">{{ post.contenido }}</p>
+                    <hr class="my-2 opacity-25">
+                    
+                    <div class="d-flex gap-4 mb-3">
+                        <a href="/like/{{ post.id }}" class="btn btn-link btn-sm text-decoration-none p-0">
+                            {% if post.liked %}<i class="bi bi-heart-fill text-danger"></i>{% else %}<i class="bi bi-heart text-muted"></i>{% endif %}
+                            <strong class="text-dark">{{ post.likes }}</strong>
+                        </a>
+                        <button class="btn btn-link btn-sm text-decoration-none text-muted p-0" type="button" data-bs-toggle="collapse" data-bs-target="#comments-{{ post.id }}">
+                            <i class="bi bi-chat-left-dots"></i> Comentarios ({{ post.comentarios|length }})
+                        </button>
+                    </div>
+
+                    <div class="collapse bg-light p-3 rounded" id="comments-{{ post.id }}">
+                        {% for c in post.comentarios %}
+                            <div class="mb-2 border-bottom pb-1">
+                                <strong class="small text-dark">{{ c[0] }} {{ c[1] }}</strong>
+                                <span class="text-muted x-small ms-2">{{ c[3].strftime('%d/%m %H:%M') }}</span>
+                                <p class="mb-0 small">{{ c[2] }}</p>
+                            </div>
+                        {% endfor %}
+                        <form action="/add_comment" method="POST" class="mt-2 d-flex">
+                            <input type="hidden" name="id_pub" value="{{ post.id }}">
+                            <input type="text" name="contenido" class="form-control form-control-sm me-2" placeholder="Escribe un comentario..." required>
+                            <button type="submit" class="btn btn-primary btn-sm"><i class="bi bi-send"></i></button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            {% else %}
+                <div class="text-center py-5 text-muted"><p>No hay publicaciones.</p></div>
+            {% endfor %}
+        </div>
+
+        <div class="col-md-3 d-none d-lg-block">
+            <div class="card shadow-sm border-0">
+                <div class="card-header bg-white fw-bold">Mis Conexiones</div>
+                <div class="list-group list-group-flush">
+                    {% for c in mis_conexiones %}
+                    <a href="/perfil/{{ c[0] }}" class="list-group-item list-group-item-action d-flex align-items-center">
+                        <div class="bg-primary-subtle rounded-circle me-2 d-flex justify-content-center align-items-center text-primary fw-bold" style="width: 32px; height: 32px;">{{ c[1][0] }}</div>
+                        <div class="flex-grow-1 overflow-hidden">
+                            <div class="text-truncate fw-bold small">{{ c[1] }} {{ c[2] }}</div>
+                            <div class="text-muted x-small">{{ c[3]|title }}</div>
+                        </div>
+                    </a>
+                    {% else %}
+                    <div class="p-3 text-center text-muted small">No tienes conexiones activas.</div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

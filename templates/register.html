@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}Registro - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-5 mb-5">
+    <div class="row justify-content-center">
+        <div class="col-md-8 col-lg-6">
+            <div class="card shadow">
+                <div class="card-body p-5">
+                    
+                    <h2 class="text-center fw-bold text-primary mb-4">REGISTRARSE</h2>
+                    <p class="text-center text-muted mb-4">Únete a la comunidad global UCAB</p>
+
+                    {% with messages = get_flashed_messages() %}
+                        {% if messages %}
+                            <div class="alert alert-warning alert-dismissible fade show" role="alert">
+                                {{ messages[0] }}
+                                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                            </div>
+                        {% endif %}
+                    {% endwith %}
+
+                    <form action="/register" method="POST">
+                        
+                        <h5 class="text-secondary border-bottom pb-2 mb-3">Datos de Cuenta</h5>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Correo Electrónico</label>
+                            <input type="email" name="email" class="form-control" placeholder="usuario@correo.com" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Contraseña</label>
+                            <input type="password" name="password" class="form-control" placeholder="******" required>
+                        </div>
+
+                        <h5 class="text-secondary border-bottom pb-2 mb-3 mt-4">Datos Personales</h5>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Cédula de Identidad</label>
+                            <input type="number" name="ci" class="form-control" placeholder="Ej: 28123456" required>
+                        </div>
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label fw-bold">Nombre</label>
+                                <input type="text" name="nombre" class="form-control" placeholder="Ej: Juan" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label fw-bold">Apellido</label>
+                                <input type="text" name="apellido" class="form-control" placeholder="Ej: Pérez" required>
+                            </div>
+                        </div>
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label fw-bold">Fecha de Nacimiento</label>
+                                <input type="date" name="fecha_nac" class="form-control" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label fw-bold">Sexo</label>
+                                <select name="sexo" class="form-select" required>
+                                    <option value="" selected disabled>Seleccione...</option>
+                                    <option value="M">Masculino</option>
+                                    <option value="F">Femenino</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <h5 class="text-secondary border-bottom pb-2 mb-3 mt-4">Ubicación y Contacto</h5>
+                        <div class="row">
+                            <div class="col-md-4 mb-3">
+                                <label class="form-label fw-bold">País</label>
+                                <input type="text" name="pais" class="form-control" placeholder="Ej: España" required>
+                            </div>
+                            <div class="col-md-4 mb-3">
+                                <label class="form-label fw-bold">Estado/Provincia</label>
+                                <input type="text" name="estado" class="form-control" placeholder="Ej: Madrid" required>
+                            </div>
+                            <div class="col-md-4 mb-3">
+                                <label class="form-label fw-bold">Ciudad</label>
+                                <input type="text" name="ciudad" class="form-control" placeholder="Ej: Madrid" required>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Dirección Detallada</label>
+                            <textarea name="direccion" class="form-control" rows="2" placeholder="Av. Principal, Edificio A, Apto 1..." required></textarea>
+                        </div>
+
+                        <h5 class="text-secondary border-bottom pb-2 mb-3 mt-4">Vinculación UCAB</h5>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Rol Principal</label>
+                            <select name="rol_ucab" class="form-select" required>
+                                <option value="" selected disabled>¿Qué eres en la universidad?</option>
+                                <option value="estudiante">Estudiante</option>
+                                <option value="profesor">Profesor</option>
+                                <option value="egresado">Egresado</option>
+                                <option value="empleado">Empleado</option>
+                            </select>
+                        </div>
+                        <div class="mb-4">
+                            <label class="form-label fw-bold">Escuela o Dependencia</label>
+                            <select name="escuela" class="form-select" required>
+                                <option value="100">Ingeniería Informática</option>
+                                <option value="101">Ingeniería Civil</option>
+                                <option value="102">Comunicación Social</option>
+                                <option value="200">Secretaría</option>
+                            </select>
+                        </div>
+
+                        <div class="d-grid gap-2 mt-5">
+                            <button type="submit" class="btn btn-primary btn-lg fw-bold">COMPLETAR REGISTRO</button>
+                        </div>
+
+                    </form>
+
+                    <div class="text-center mt-4">
+                        <p class="mb-0">¿Ya tienes cuenta? <a href="/login" class="text-decoration-none fw-bold">Iniciar Sesión</a></p>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

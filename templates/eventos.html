@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Eventos - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <h2 class="fw-bold mb-4">Calendario de Eventos</h2>
+    {% with messages = get_flashed_messages() %}
+        {% if messages %}<div class="alert alert-info">{{ messages[0] }}</div>{% endif %}
+    {% endwith %}
+
+    <div class="list-group shadow-sm border-0">
+        {% for e in eventos %}
+        <div class="list-group-item p-4 border-0 mb-2 rounded shadow-sm {% if e[9] == 'finalizado' %}bg-light text-muted{% else %}bg-white{% endif %}">
+            <div class="row align-items-center">
+                <div class="col-md-2 text-center border-end">
+                    <h3 class="fw-bold {% if e[9] == 'finalizado' %}text-secondary{% else %}text-primary{% endif %} mb-0">{{ e[3].strftime('%d') }}</h3>
+                    <small class="text-uppercase d-block">{{ e[3].strftime('%b %Y') }}</small>
+                    <small>{{ e[3].strftime('%H:%M') }}</small>
+                </div>
+                
+                <div class="col-md-7 ps-4">
+                    {% if e[9] == 'finalizado' %}
+                        <span class="badge bg-secondary mb-2">FINALIZADO</span>
+                    {% elif e[9] == 'borrador' %}
+                        <span class="badge bg-warning text-dark mb-2">BORRADOR</span>
+                    {% endif %}
+                
+                    {% if e[7] %}
+                        <small class="fw-bold d-block text-primary"><i class="bi bi-people-fill"></i> Grupo: {{ e[7] }}</small>
+                    {% endif %}
+                    
+                    <h5 class="fw-bold mb-1 mt-1">{{ e[1] }}</h5>
+                    <span class="badge bg-light text-dark border me-2">{{ e[2]|format_tipo }}</span>
+                    <small><i class="bi bi-geo-alt"></i> {{ e[4] }} • {{ e[5] }} asistentes</small>
+                </div>
+                
+                <div class="col-md-3 text-end">
+                    
+                    {% if e[9] == 'publicado' and session.get('db_role') != 'rol_institucional' and session.get('db_role') != 'rol_auditor' %}
+                        {% if e[6] %}
+                            <div class="btn-group">
+                                <button class="btn btn-success btn-sm disabled"><i class="bi bi-check"></i> Listo</button>
+                                <a href="/unjoin_event/{{ e[0] }}" class="btn btn-outline-danger btn-sm" title="Cancelar asistencia"><i class="bi bi-x"></i></a>
+                            </div>
+                        {% else %}
+                            <a href="/asistir/{{ e[0] }}" class="btn btn-primary btn-sm px-4 rounded-pill">Asistir</a>
+                        {% endif %}
+                    {% endif %}
+                    
+                    {% if e[7] and e[9] == 'publicado' and e[10] %}
+                        <div class="mt-2">
+                            <a href="/notify_group/{{ e[0] }}/{{ e[8] }}" class="btn btn-warning btn-sm text-dark fw-bold text-decoration-none">
+                                <i class="bi bi-megaphone-fill"></i> Notificar al Grupo
+                            </a>
+                        </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+        {% else %}
+        <div class="alert alert-warning">No hay eventos visibles.</div>
+        {% endfor %}
+    </div>
+
+    <div class="d-flex justify-content-center mt-4 pb-4">
+        {% if page > 1 %}
+            <a href="{{ url_for('lista_eventos', page=page-1) }}" class="btn btn-outline-primary me-2">
+                <i class="bi bi-arrow-left"></i> Anteriores
+            </a>
+        {% endif %}
+        
+        <span class="align-self-center text-muted mx-2 fw-bold">Página {{ page }}</span>
+        
+        {% if has_next %}
+            <a href="{{ url_for('lista_eventos', page=page+1) }}" class="btn btn-outline-primary ms-2">
+                Siguientes <i class="bi bi-arrow-right"></i>
+            </a>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

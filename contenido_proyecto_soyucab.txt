@@ -1,0 +1,3309 @@
+ESTRUCTURA Y CONTENIDO DEL PROYECTO: SoyUCAB_App
+============================================================
+
+
+--- INICIO DE ARCHIVO: app.py ---
+----------------------------------------
+from flask import Flask, render_template, request, redirect, url_for, session, flash
+from db import get_db_connection
+from werkzeug.security import generate_password_hash, check_password_hash
+import datetime
+import random
+import string
+
+app = Flask(__name__)
+app.secret_key = 'soyucab_secret_key'
+
+# Función auxiliar para conectar con el ROL ESPECÍFICO de la sesión
+def get_db_connection_with_role():
+    conn = get_db_connection() # Usa app_backend (definido en db.py)
+    if conn:
+        cur = conn.cursor()
+        try:
+            # 1. CAMBIO DE ROL: Si la sesión dice que es Institución, nos disfrazamos
+            if 'db_role' in session:
+                cur.execute(f"SET ROLE {session['db_role']}")
+            
+            # 2. CONTEXTO RLS: Inyectamos el ID del usuario
+            if 'user_id' in session:
+                cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+                
+        except Exception as e:
+            print(f"Error configurando rol/contexto: {e}")
+        cur.close()
+    return conn
+
+# --- 🛠️ CONTEXTO GLOBAL ---
+@app.context_processor
+def global_data():
+    data = {'notif_count': 0, 'lista_ocupaciones': []}
+    if 'user_id' in session:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # [SEGURIDAD] Inyectar contexto RLS
+        try: cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+        except: pass
+        
+        cur.execute("SELECT COUNT(*) FROM Notificacion WHERE id_ente = %s AND estado = 'no-leida'", (session['user_id'],))
+        data['notif_count'] = cur.fetchone()[0]
+        cur.execute("SELECT DISTINCT ocupacion FROM Persona WHERE ocupacion IS NOT NULL ORDER BY 1")
+        data['lista_ocupaciones'] = [row[0] for row in cur.fetchall()]
+        cur.close()
+        conn.close()
+    return data
+
+@app.template_filter('format_tipo')
+def format_tipo(value):
+    return value.replace('-', ' ').title() if value else ''
+
+# --- 🚀 RUTA 1: LANDING PAGE ---
+@app.route('/')
+def index(): return render_template('landing.html')
+
+# --- 🔑 RUTA 2: LOGIN ---
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if 'user_id' in session: return redirect(url_for('home'))
+    
+    if request.method == 'POST':
+        email, pwd = request.form['email'], request.form['password']
+        
+        # Conexión genérica para buscar credenciales
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Buscamos ID, Password y TIPO
+        cur.execute("SELECT id_ente, password, tipo FROM Ente WHERE correoElectronico = %s", (email,))
+        user = cur.fetchone()
+        cur.close(); conn.close()
+        
+        if user and check_password_hash(user[1], pwd):
+            session['user_id'] = user[0]
+            session['user_email'] = email
+            tipo_ente = user[2] # 'Persona', 'Dependencia', 'Organizacion'
+            
+            # --- CEREBRO DEL LOGIN INTELIGENTE ---
+            if email == 'auditor@ucab.edu.ve':
+                session['db_role'] = 'rol_auditor'
+                return redirect(url_for('dashboard_auditor'))
+                
+            elif email == 'admin@ucab.edu.ve':
+                session['db_role'] = 'rol_admin_dba'
+                return redirect(url_for('admin_panel'))
+                
+            elif tipo_ente in ['Dependencia', 'Organizacion']:
+                # SI ES ESCUELA/EMPRESA -> ROL INSTITUCIONAL
+                session['db_role'] = 'rol_institucional'
+                return redirect(url_for('home_institucional'))
+                
+            else:
+                # SI ES PERSONA -> ROL USUARIO COMÚN
+                session['db_role'] = 'rol_usuario_comun'
+                return redirect(url_for('home'))
+                
+        flash('Credenciales incorrectas.')
+    return render_template('login.html')
+
+# --- 🏠 RUTA 3: HOME (DISTRIBUIDOR CENTRAL) ---
+@app.route('/home')
+def home():
+    if 'user_id' not in session: return redirect(url_for('login'))
+    
+    # 1. SI ES UN ROL ESPECIAL, REDIRIGIR A SU PROPIO DASHBOARD
+    rol = session.get('db_role')
+    if rol == 'rol_institucional':
+        return redirect(url_for('home_institucional'))
+    elif rol == 'rol_auditor':
+        return redirect(url_for('dashboard_auditor'))
+    elif rol == 'rol_admin_dba':
+        return redirect(url_for('admin_panel'))
+
+    # 2. SI ES USUARIO COMÚN (Estudiante/Profesor), CARGAR EL FEED SOCIAL
+    uid = session['user_id']
+    conn = get_db_connection_with_role() # Usar conexión con rol
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    try: cur.execute("SET app.current_ente_id = %s", (str(uid),))
+    except: pass
+
+    # Obtener nombre de la Persona
+    cur.execute("SELECT nombre, apellido FROM Persona WHERE id_ente = %s", (uid,))
+    persona = cur.fetchone()
+    
+    # (Validación extra por si la BD está inconsistente)
+    if not persona:
+        cur.close(); conn.close()
+        flash("Error: Perfil de persona no encontrado.")
+        return redirect(url_for('logout'))
+    
+    # --- QUERY POSTS ---
+    cur.execute("""
+        SELECT DISTINCT P.nombre, P.apellido, Pub.contenidoTexto, Pub.tipo, A.fechaPublicacion, 
+               Pub.id_publicacion,
+               (SELECT COUNT(*) FROM Reaccion WHERE id_publicacion = Pub.id_publicacion) as total_likes,
+               EXISTS(SELECT 1 FROM Reaccion WHERE id_publicacion = Pub.id_publicacion AND id_ente = %s) as user_liked,
+               A.id_ente as autor_id
+        FROM Publicacion Pub
+        JOIN Publica A ON Pub.id_publicacion = A.id_publicacion
+        JOIN Persona P ON A.id_ente = P.id_ente
+        LEFT JOIN Relacion R ON (R.id_ente1 = %s AND R.id_ente2 = A.id_ente) 
+                            OR (R.id_ente2 = %s AND R.id_ente1 = A.id_ente)
+        WHERE A.id_ente = %s 
+           OR Pub.visibilidad = 'publica' 
+           OR (Pub.visibilidad = 'solo-amigos' AND R.estado = 'aceptada')
+           -- Arreglo para ver posts huérfanos propios recién creados
+           OR (Pub.visibilidad = 'privada' AND A.id_ente = %s)
+        ORDER BY A.fechaPublicacion DESC LIMIT 15;
+    """, (uid, uid, uid, uid, uid))
+    posts_raw = cur.fetchall()
+    
+    posts = []
+    for p in posts_raw:
+        cur.execute("SELECT P.nombre, P.apellido, C.contenido, C.fecha FROM Comentario C JOIN Persona P ON C.id_ente = P.id_ente WHERE C.id_publicacion = %s ORDER BY C.fecha ASC", (p[5],))
+        posts.append({
+            'autor': f"{p[0]} {p[1]}", 'contenido': p[2], 'tipo': p[3], 'fecha': p[4],
+            'id': p[5], 'likes': p[6], 'liked': p[7], 'es_mio': (p[8] == uid),
+            'comentarios': cur.fetchall()
+        })
+
+    # --- QUERY CONEXIONES (DISTINCT) ---
+    cur.execute("""
+        SELECT DISTINCT P.id_ente, P.nombre, P.apellido, R.tipo, P.ocupacion
+        FROM Relacion R
+        JOIN Persona P ON P.id_ente = (CASE WHEN R.id_ente1 = %s THEN R.id_ente2 ELSE R.id_ente1 END)
+        WHERE (R.id_ente1 = %s OR R.id_ente2 = %s) AND R.estado = 'aceptada'
+        LIMIT 5
+    """, (uid, uid, uid))
+    mis_conexiones = cur.fetchall()
+
+    cur.close()
+    conn.close()
+    return render_template('home.html', user_name=f"{persona[0]} {persona[1]}", posts=posts, uid=uid, mis_conexiones=mis_conexiones)
+
+# --- 📝 RUTA 4: REGISTRO ---
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        email, p_hash = request.form['email'], generate_password_hash(request.form['password'])
+        ci, nom, ape = request.form['ci'], request.form['nombre'], request.form['apellido']
+        rol, id_esc = request.form['rol_ucab'], request.form.get('escuela', 100)
+        tai = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            # Nota: Registro no lleva RLS user_id porque es usuario nuevo
+            cur.execute("INSERT INTO Ente (tipo, correoElectronico, password, ubicacion_pais, ubicacion_estado, ubicacion_ciudad, direccion_detalle) VALUES ('Persona', %s, %s, %s, %s, %s, %s) RETURNING id_ente;", 
+                        (email, p_hash, request.form['pais'], request.form['estado'], request.form['ciudad'], request.form['direccion']))
+            nuevo_id = cur.fetchone()[0]
+            cur.execute("INSERT INTO Persona (id_ente, CI, nombre, apellido, fechaNacimiento, sexo, ocupacion) VALUES (%s,%s,%s,%s,%s,%s,%s);", 
+                        (nuevo_id, ci, nom, ape, request.form['fecha_nac'], request.form['sexo'], rol))
+            cur.execute("INSERT INTO Nexo_Institucional (TAI, tipoNexo, fechaInicio, estado) VALUES (%s,%s,CURRENT_DATE,'activo');", (tai, rol.capitalize()))
+            cur.execute("INSERT INTO Forma_Parte_De (TAI, id_persona, id_dependencia) VALUES (%s,%s,%s);", (tai, nuevo_id, id_esc))
+            conn.commit()
+            flash('¡Registro exitoso!')
+            return redirect(url_for('login'))
+        except Exception as e:
+            conn.rollback()
+            flash(f'Error: {e}')
+        finally:
+            cur.close()
+            conn.close()
+    return render_template('register.html')
+
+# --- 🚪 RUTA 5: LOGOUT ---
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('index'))
+
+# --- 📣 RUTA 6: GESTIÓN DE POSTS ---
+@app.route('/create_post', methods=['POST'])
+def create_post():
+    if 'user_id' not in session: return redirect(url_for('login'))
+    con, tip, vis = request.form['contenido'], request.form['tipo'], request.form['visibilidad']
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+    
+    cur.execute("INSERT INTO Publicacion (tipo, contenidoTexto, visibilidad) VALUES (%s, %s, %s) RETURNING id_publicacion;", (tip, con, vis))
+    pid = cur.fetchone()[0]
+    cur.execute("INSERT INTO Publica (id_publicacion, id_ente, fechaPublicacion) VALUES (%s, %s, CURRENT_TIMESTAMP AT TIME ZONE 'America/Caracas');", (pid, session['user_id']))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return redirect(url_for('home'))
+
+@app.route('/delete_post/<int:id_pub>')
+def delete_post(id_pub):
+    if 'user_id' not in session: return redirect(url_for('login'))
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    try: cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+    except: pass
+
+    # 1. Verificar si el post es mío (Validación extra de seguridad)
+    cur.execute("SELECT 1 FROM Publica WHERE id_publicacion = %s AND id_ente = %s", (id_pub, session['user_id']))
+    if cur.fetchone():
+        try:
+            # 2. PASO CLAVE: Borrar primero la relación en 'Publica' (El Hijo)
+            # Esto elimina el bloqueo de llave foránea.
+            cur.execute("DELETE FROM Publica WHERE id_publicacion = %s", (id_pub,))
+            
+            # 3. Borrar el contenido en 'Publicacion' (El Padre)
+            cur.execute("DELETE FROM Publicacion WHERE id_publicacion = %s", (id_pub,))
+            
+            conn.commit()
+            flash("Post eliminado correctamente.")
+        except Exception as e:
+            conn.rollback()
+            flash(f"Error al eliminar: {e}")
+            print(f"DEBUG ERROR DELETE: {e}")
+            
+    cur.close(); conn.close()
+    return redirect(url_for('home'))
+
+@app.route('/add_comment', methods=['POST'])
+def add_comment():
+    if 'user_id' not in session: return redirect(url_for('login'))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+    
+    cur.execute("INSERT INTO Comentario (id_publicacion, id_ente, contenido) VALUES (%s, %s, %s)", (request.form['id_pub'], session['user_id'], request.form['contenido']))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return redirect(url_for('home'))
+
+# --- 👤 RUTA 7: PERFIL (CORREGIDO PARA MOSTRAR DATOS REALES) ---
+@app.route('/perfil')
+@app.route('/perfil/<int:user_id_ver>')
+def perfil(user_id_ver=None):
+    if 'user_id' not in session: return redirect(url_for('login'))
+    uid, target = session['user_id'], user_id_ver if user_id_ver else session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(uid),))
+    
+    # QUERY EXPLÍCITA
+    cur.execute("""
+        SELECT P.CI, P.nombre, P.apellido, P.ocupacion, P.fechaNacimiento, 
+               E.correoElectronico, E.ubicacion_ciudad, E.ubicacion_estado, E.direccion_detalle, E.ubicacion_pais
+        FROM Persona P JOIN Ente E ON P.id_ente = E.id_ente 
+        WHERE P.id_ente = %s
+    """, (target,))
+    datos = cur.fetchone()
+    
+    cur.execute("SELECT NI.tipoNexo, D.nombre, NI.fechaInicio FROM Nexo_Institucional NI JOIN Forma_Parte_De FPD ON NI.TAI = FPD.TAI JOIN Dependencia_UCAB D ON FPD.id_dependencia = D.id_ente WHERE FPD.id_persona = %s", (target,))
+    nexo = cur.fetchone()
+    cur.execute("SELECT nombre_habilidad FROM Es_Poseida WHERE id_ente_persona = %s", (target,))
+    mis_habs = [h[0] for h in cur.fetchall()]
+    cur.execute("SELECT nombre FROM Habilidad_Tecnica")
+    cat_habs = cur.fetchall()
+    cur.execute("SELECT tipo, estado FROM Relacion WHERE id_ente1 = %s AND id_ente2 = %s", (uid, target))
+    rels = {row[0]: row[1] for row in cur.fetchall()}
+    
+    # Mis Relaciones (Completo)
+    mis_relaciones = []
+    if uid == target:
+        cur.execute("""
+            SELECT P.nombre, P.apellido, R.tipo, P.id_ente, R.estado 
+            FROM Relacion R 
+            JOIN Persona P ON P.id_ente = (CASE WHEN R.id_ente1 = %s THEN R.id_ente2 ELSE R.id_ente1 END)
+            WHERE (R.id_ente1 = %s OR R.id_ente2 = %s) AND R.estado IN ('aceptada', 'pendiente')
+        """, (uid, uid, uid))
+        mis_relaciones = cur.fetchall()
+
+    cur.close()
+    conn.close()
+    return render_template('perfil.html', datos=datos, nexo=nexo, es_mio=(uid==target), relaciones=rels, id_obj=target, mis_habs=mis_habs, cat_habs=cat_habs, mis_relaciones=mis_relaciones)
+
+# --- 🛠️ RUTA 8: EDITAR PERFIL ---
+@app.route('/edit_perfil', methods=['POST'])
+def edit_perfil():
+    if 'user_id' not in session: return redirect(url_for('login'))
+    uid = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(uid),))
+
+    try:
+        cur.execute("UPDATE Persona SET nombre=%s, apellido=%s, ocupacion=%s WHERE id_ente=%s", (request.form['nombre'], request.form['apellido'], request.form['ocupacion'], uid))
+        cur.execute("UPDATE Ente SET ubicacion_estado=%s, ubicacion_ciudad=%s, direccion_detalle=%s WHERE id_ente=%s", (request.form['estado'], request.form['ciudad'], request.form['direccion'], uid))
+        cur.execute("DELETE FROM Es_Poseida WHERE id_ente_persona = %s", (uid,))
+        for hab in request.form.getlist('habilidades'):
+            cur.execute("INSERT INTO Es_Poseida (id_ente_persona, nombre_habilidad) VALUES (%s, %s)", (uid, hab))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
+    return redirect(url_for('perfil'))
+
+# --- 🔍 RUTA 9: BUSCADOR ---
+@app.route('/usuarios')
+def lista_usuarios():
+    if 'user_id' not in session: return redirect(url_for('login'))
+    uid = session['user_id']
+    q, ciu, ocu = request.args.get('q', ''), request.args.get('ciudad', ''), request.args.get('ocupacion', '')
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(uid),))
+    
+    query = """
+        SELECT p.id_ente, p.nombre, p.apellido, p.ocupacion,
+        EXISTS(SELECT 1 FROM Relacion r WHERE r.id_ente1 = %s AND r.id_ente2 = p.id_ente AND r.tipo = 'seguimiento'),
+        e.ubicacion_ciudad
+        FROM Persona p JOIN Ente e ON p.id_ente = e.id_ente
+        WHERE (p.nombre ILIKE %s OR p.apellido ILIKE %s) AND p.id_ente != %s
+    """
+    params = [uid, f"%{q}%", f"%{q}%", uid]
+    if ciu: query += " AND e.ubicacion_ciudad ILIKE %s"; params.append(f"%{ciu}%")
+    if ocu: query += " AND p.ocupacion = %s"; params.append(ocu)
+    query += " LIMIT 50"
+    cur.execute(query, tuple(params))
+    usuarios = cur.fetchall()
+    cur.close()
+    conn.close()
+    return render_template('usuarios.html', usuarios=usuarios, q=q, ciudad=ciu, ocupacion=ocu)
+
+# --- 🤝 RUTA 10-14: ACCIONES SOCIALES ---
+@app.route('/add_relation/<int:id_destino>/<string:tipo_rel>')
+def add_relation(id_destino, tipo_rel):
+    if 'user_id' not in session: return redirect(url_for('login'))
+    uid, est, dire = session['user_id'], 'aceptada' if tipo_rel == 'seguimiento' else 'pendiente', 'asimetrica'
+    if tipo_rel == 'amistad': dire = 'simetrica'
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(uid),))
+    
+    try:
+        cur.execute("INSERT INTO Relacion (id_ente1, id_ente2, tipo, direccionalidad, estado, fechaInicio) VALUES (%s, %s, %s, %s, %s, CURRENT_DATE) ON CONFLICT DO NOTHING", (uid, id_destino, tipo_rel, dire, est))
+        if est == 'pendiente':
+            cur.execute("INSERT INTO Notificacion (id_ente, fechaEmision, tipo, estado, contenidoResumen, tipoOrigen) VALUES (%s, CURRENT_TIMESTAMP, 'solicitud Relacion', 'no-leida', 'Nueva solicitud de conexión', 'Persona')", (id_destino,))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    return redirect(request.referrer)
+
+@app.route('/remove_relation/<int:id_destino>/<string:tipo_rel>')
+def remove_relation(id_destino, tipo_rel):
+    if 'user_id' not in session: return redirect(url_for('login'))
+    
+    uid = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    try:
+        cur.execute("SET app.current_ente_id = %s", (str(uid),))
+    except:
+        pass
+    
+    if tipo_rel == 'amistad':
+        # CASO AMISTAD: Borrado Bidireccional (Espejo)
+        # Borramos tanto (Yo -> Él) como (Él -> Yo)
+        query = """
+            DELETE FROM Relacion 
+            WHERE tipo = 'amistad' 
+            AND (
+                (id_ente1 = %s AND id_ente2 = %s) 
+                OR 
+                (id_ente1 = %s AND id_ente2 = %s)
+            )
+        """
+        cur.execute(query, (uid, id_destino, id_destino, uid))
+    else:
+        # CASO SEGUIR/TUTORÍA: Borrado Unilateral
+        # Solo borro mi propia solicitud o seguimiento
+        query = "DELETE FROM Relacion WHERE id_ente1 = %s AND id_ente2 = %s AND tipo = %s"
+        cur.execute(query, (uid, id_destino, tipo_rel))
+
+    conn.commit()
+    cur.close(); conn.close()
+    return redirect(request.referrer)
+
+@app.route('/cancel_request/<int:id_destino>/<string:tipo_rel>')
+def cancel_request(id_destino, tipo_rel):
+    if 'user_id' not in session: return redirect(url_for('login'))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+    
+    cur.execute("DELETE FROM Relacion WHERE id_ente1 = %s AND id_ente2 = %s AND tipo = %s AND estado = 'pendiente'", (session['user_id'], id_destino, tipo_rel))
+    conn.commit()
+    cur.close(); conn.close()
+    return redirect(request.referrer)
+
+@app.route('/like/<int:id_pub>')
+def like_post(id_pub):
+    if 'user_id' not in session: return redirect(url_for('login'))
+    uid = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(uid),))
+    
+    cur.execute("SELECT 1 FROM Reaccion WHERE id_publicacion = %s AND id_ente = %s", (id_pub, uid))
+    if cur.fetchone():
+        cur.execute("DELETE FROM Reaccion WHERE id_publicacion = %s AND id_ente = %s", (id_pub, uid))
+    else:
+        cur.execute("INSERT INTO Reaccion (id_publicacion, id_ente) VALUES (%s, %s)", (id_pub, uid))
+    conn.commit(); cur.close(); conn.close()
+    return redirect(url_for('home'))
+
+# --- RUTAS DE GRUPOS, EVENTOS Y DASHBOARD ---
+@app.route('/grupos')
+def lista_grupos():
+    if 'user_id' not in session: return redirect(url_for('login'))
+    q = request.args.get('q', '')
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+    
+    cur.execute("""
+        SELECT g.id_grupo, g.nombre, g.tipoGrupo, 
+        EXISTS(SELECT 1 FROM Membresia_Grupo WHERE id_grupo = g.id_grupo AND id_ente = %s),
+        (SELECT COUNT(*) FROM Membresia_Grupo WHERE id_grupo = g.id_grupo)
+        FROM Grupo g WHERE g.nombre ILIKE %s ORDER BY g.nombre ASC;
+    """, (session['user_id'], f"%{q}%"))
+    grupos = cur.fetchall()
+    cur.close(); conn.close()
+    return render_template('grupos.html', grupos=grupos, q=q)
+
+@app.route('/join_group/<int:id_grupo>')
+def join_group(id_grupo):
+    if 'user_id' not in session: return redirect(url_for('login'))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+    
+    cur.execute("INSERT INTO Membresia_Grupo (id_grupo, id_ente, rol, fechaIngreso, estado) VALUES (%s, %s, 'miembro', CURRENT_DATE, 'activo') ON CONFLICT DO NOTHING", (id_grupo, session['user_id']))
+    conn.commit(); cur.close(); conn.close()
+    return redirect(url_for('lista_grupos'))
+
+@app.route('/leave_group/<int:id_grupo>')
+def leave_group(id_grupo):
+    if 'user_id' not in session: return redirect(url_for('login'))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+    
+    cur.execute("DELETE FROM Membresia_Grupo WHERE id_grupo = %s AND id_ente = %s", (id_grupo, session['user_id']))
+    conn.commit(); cur.close(); conn.close()
+    return redirect(url_for('lista_grupos'))
+
+@app.route('/eventos')
+def lista_eventos():
+    if 'user_id' not in session: return redirect(url_for('login'))
+    uid = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    try:
+        cur.execute("SET app.current_ente_id = %s", (str(uid),))
+    except:
+        pass
+    
+    # MODIFICACIÓN: Agregamos columna 10 para saber si es organizador
+    # Indices: 
+    # 0:id, 1:nom, 2:tipo, 3:fecha, 4:lugar, 5:cant, 6:asistire?, 
+    # 7:nom_grupo, 8:id_grup, 9:estado, 10:ES_ORGANIZADOR
+    cur.execute("""
+        SELECT e.id_evento, e.nombre, e.tipo, e.fechaHoraInicio, e.lugar, e.cantidad_asistentes,
+        EXISTS(SELECT 1 FROM Asistencia_Evento WHERE id_evento = e.id_evento AND id_ente_persona = %s),
+        G.nombre as nombre_grupo, G.id_grupo, e.estado,
+        (OE.id_ente IS NOT NULL) as es_organizador
+        FROM Evento e 
+        LEFT JOIN Evento_Grupo EG ON e.id_evento = EG.id_evento
+        LEFT JOIN Grupo G ON EG.id_grupo = G.id_grupo
+        LEFT JOIN Organizador_Evento OE ON e.id_evento = OE.id_evento AND OE.id_ente = %s
+        WHERE e.estado IN ('publicado', 'finalizado') OR (e.estado = 'borrador' AND OE.id_ente IS NOT NULL)
+        ORDER BY e.fechaHoraInicio DESC;
+    """, (uid, uid))
+    
+    eventos = cur.fetchall()
+    cur.close(); conn.close()
+    return render_template('eventos.html', eventos=eventos)
+
+@app.route('/asistir/<int:id_evento>')
+def asistir_evento(id_evento):
+    if 'user_id' not in session: return redirect(url_for('login'))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+    
+    cur.execute("INSERT INTO Asistencia_Evento (id_evento, id_ente_persona, estadoRegistro, fechaRegistro) VALUES (%s, %s, 'confirmado', CURRENT_DATE) ON CONFLICT DO NOTHING", (id_evento, session['user_id']))
+    conn.commit(); cur.close(); conn.close()
+    return redirect(url_for('lista_eventos'))
+
+@app.route('/unjoin_event/<int:id_evento>')
+def unjoin_event(id_evento):
+    if 'user_id' not in session: return redirect(url_for('login'))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+    
+    cur.execute("DELETE FROM Asistencia_Evento WHERE id_evento = %s AND id_ente_persona = %s", (id_evento, session['user_id']))
+    conn.commit(); cur.close(); conn.close()
+    return redirect(url_for('lista_eventos'))
+
+@app.route('/notify_group/<int:id_evento>/<int:id_grupo>')
+def notify_group(id_evento, id_grupo):
+    if 'user_id' not in session: return redirect(url_for('login'))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+    
+    cur.execute("CALL sp_notificar_evento_grupo(%s, %s)", (id_evento, id_grupo))
+    conn.commit(); cur.close(); conn.close()
+    return redirect(url_for('lista_eventos'))
+
+@app.route('/notificaciones')
+def notificaciones():
+    if 'user_id' not in session: return redirect(url_for('login'))
+    uid = session['user_id']
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(uid),))
+    
+    cur.execute("""
+        SELECT n.fechaEmision, n.tipo, n.contenidoResumen, n.estado, r.id_ente1, r.tipo as tipo_rel
+        FROM Notificacion n
+        LEFT JOIN Relacion r ON r.id_ente2 = n.id_ente AND r.estado = 'pendiente' AND r.id_ente2 = %s
+        WHERE n.id_ente = %s 
+        ORDER BY n.fechaEmision DESC
+    """, (uid, uid))
+    notifs = cur.fetchall()
+    cur.execute("UPDATE Notificacion SET estado = 'leida' WHERE id_ente = %s", (uid,))
+    conn.commit(); cur.close(); conn.close()
+    return render_template('notificaciones.html', notificaciones=notifs)
+
+@app.route('/responder_solicitud/<int:id_origen>/<string:tipo_rel>/<string:respuesta>')
+def responder_solicitud(id_origen, tipo_rel, respuesta):
+    if 'user_id' not in session: return redirect(url_for('login'))
+    uid, status = session['user_id'], 'aceptada' if respuesta == 'aceptar' else 'rechazada'
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(uid),))
+    
+    cur.execute("UPDATE Relacion SET estado = %s WHERE id_ente1 = %s AND id_ente2 = %s AND tipo = %s", (status, id_origen, uid, tipo_rel))
+    if respuesta == 'aceptar' and tipo_rel == 'amistad':
+        cur.execute("INSERT INTO Relacion (id_ente1, id_ente2, tipo, direccionalidad, estado, fechaInicio) VALUES (%s, %s, 'amistad', 'simetrica', 'aceptada', CURRENT_DATE) ON CONFLICT DO NOTHING", (uid, id_origen))
+    conn.commit(); cur.close(); conn.close()
+    return redirect(url_for('notificaciones'))
+
+@app.route('/dashboard')
+def dashboard():
+    if 'user_id' not in session: return redirect(url_for('login'))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # [SEGURIDAD] Inyectar contexto RLS
+    cur.execute("SET app.current_ente_id = %s", (str(session['user_id']),))
+    
+    cur.execute("""SELECT G.nombre, COUNT(M.id_ente), CAST(COUNT(M.id_ente) * 100.0 / (SELECT COUNT(*) FROM Persona) AS DECIMAL(5,2)) FROM Grupo G LEFT JOIN Membresia_Grupo M ON G.id_grupo = M.id_grupo GROUP BY G.id_grupo, G.nombre ORDER BY 2 DESC LIMIT 5""")
+    rep1 = cur.fetchall()
+    cur.execute("""SELECT G.nombre, COUNT(EG.id_evento), CASE WHEN COUNT(EG.id_evento) >= 2 THEN 'Muy Activo' WHEN COUNT(EG.id_evento) = 1 THEN 'Regular' ELSE 'Sin Actividad' END FROM Grupo G LEFT JOIN Evento_Grupo EG ON G.id_grupo = EG.id_grupo GROUP BY G.nombre ORDER BY 2 DESC LIMIT 5""")
+    rep2 = cur.fetchall()
+    cur.execute("""SELECT P.nombre || ' ' || P.apellido, COUNT(E.id_evento), COALESCE(SUM(EXTRACT(EPOCH FROM (E.fechaHoraFin - E.fechaHoraInicio))/3600), 0) FROM Persona P JOIN Forma_Parte_De FPD ON P.id_ente = FPD.id_persona JOIN Nexo_Institucional N ON FPD.TAI = N.TAI JOIN Organizador_Evento OE ON P.id_ente = OE.id_ente JOIN Evento E ON OE.id_evento = E.id_evento WHERE N.tipoNexo = 'Profesor' GROUP BY P.id_ente, P.nombre, P.apellido ORDER BY 3 DESC LIMIT 5""")
+    rep3 = cur.fetchall()
+    cur.execute("""SELECT P.nombre || ' ' || P.apellido, N.tipoNexo, N.fechaInicio, EXTRACT(YEAR FROM AGE(CURRENT_DATE, N.fechaInicio)) FROM Nexo_Institucional N JOIN Forma_Parte_De FPD ON N.TAI = FPD.TAI JOIN Persona P ON FPD.id_persona = P.id_ente WHERE N.tipoNexo IN ('Profesor', 'Empleado') ORDER BY N.fechaInicio ASC LIMIT 5""")
+    rep4 = cur.fetchall()
+    cur.execute("""SELECT P.nombre || ' ' || P.apellido, DN.valor, R.fechaInicio FROM Persona P JOIN Forma_Parte_De FPD ON P.id_ente = FPD.id_persona JOIN Nexo_Institucional N ON FPD.TAI = N.TAI JOIN Detalle_Nexo DN ON N.TAI = DN.TAI_nexo JOIN Relacion R ON P.id_ente = R.id_ente1 WHERE N.tipoNexo = 'Egresado' AND DN.clave = 'Promedio' AND R.tipo = 'tutoria' LIMIT 5""")
+    rep5 = cur.fetchall()
+    cur.execute("""SELECT nombre, lugar, fechaHoraInicio, estado FROM Evento WHERE estado IN ('publicado', 'finalizado') ORDER BY fechaHoraInicio DESC LIMIT 5""")
+    rep6 = cur.fetchall()
+    cur.close(); conn.close()
+    return render_template('dashboard.html', rep1=rep1, rep2=rep2, rep3=rep3, rep4=rep4, rep5=rep5, rep6=rep6)
+
+# --- 🏢 RUTA NUEVA: REGISTRO INSTITUCIONAL ---
+@app.route('/register_entity', methods=['GET', 'POST'])
+def register_entity():
+    if request.method == 'POST':
+        # 1. Datos Comunes (Tabla Ente)
+        email = request.form['email']
+        p_hash = generate_password_hash(request.form['password'])
+        tipo_ente = request.form['tipo_ente'] # 'Dependencia' o 'Organizacion'
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            # Crear el Ente Padre
+            cur.execute("""
+                INSERT INTO Ente (tipo, correoElectronico, password, ubicacion_pais, ubicacion_estado, ubicacion_ciudad, direccion_detalle) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id_ente
+            """, (tipo_ente, email, p_hash, request.form['pais'], request.form['estado'], request.form['ciudad'], request.form['direccion']))
+            nuevo_id = cur.fetchone()[0]
+
+            # 2. Datos Específicos según el tipo
+            if tipo_ente == 'Dependencia':
+                # Es una Escuela, Facultad, etc.
+                cur.execute("""
+                    INSERT INTO Dependencia_UCAB (id_ente, nombre, tipoDependencia, descripcion) 
+                    VALUES (%s, %s, %s, %s)
+                """, (nuevo_id, request.form['nombre'], request.form['tipo_dep'], request.form['descripcion']))
+                
+            elif tipo_ente == 'Organizacion':
+                # Es una Empresa, Fundación, etc.
+                cur.execute("""
+                    INSERT INTO Organizacion_Asociada (id_ente, RIF, nombre, tipoOrganizacion, descripcion) 
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (nuevo_id, request.form['rif'], request.form['nombre'], request.form['tipo_org'], request.form['descripcion']))
+
+            conn.commit()
+            flash('¡Cuenta institucional creada con éxito! Por favor inicia sesión.')
+            return redirect(url_for('login'))
+            
+        except Exception as e:
+            conn.rollback()
+            flash(f'Error en registro: {e}')
+            print(f"Error: {e}")
+        finally:
+            cur.close()
+            conn.close()
+            
+    return render_template('register_entity.html')
+
+# --- 🏛️ RUTAS INSTITUCIONALES (SOLO ESCUELAS/EMPRESAS) ---
+
+@app.route('/institucional')
+def home_institucional():
+    # Protección: Solo entra si tiene el rol correcto
+    if 'user_id' not in session or session.get('db_role') != 'rol_institucional':
+        return redirect(url_for('login'))
+        
+    conn = get_db_connection_with_role() # Usamos la conexión con superpoderes limitados
+    cur = conn.cursor()
+    
+    # 1. Datos de la propia institución
+    cur.execute("""
+        SELECT D.nombre, D.tipoDependencia, E.ubicacion_ciudad 
+        FROM Dependencia_UCAB D JOIN Ente E ON D.id_ente = E.id_ente 
+        WHERE D.id_ente = %s
+        UNION
+        SELECT O.nombre, O.tipoOrganizacion, E.ubicacion_ciudad 
+        FROM Organizacion_Asociada O JOIN Ente E ON O.id_ente = E.id_ente 
+        WHERE O.id_ente = %s
+    """, (session['user_id'], session['user_id']))
+    datos = cur.fetchone()
+    
+    # 2. Sus Eventos (La política RLS filtra esto automáticamente)
+    cur.execute("""
+        SELECT id_evento, nombre, fechaHoraInicio, lugar, estado, cantidad_asistentes 
+        FROM Evento 
+        ORDER BY fechaHoraInicio DESC
+    """)
+    mis_eventos = cur.fetchall()
+    
+    cur.close(); conn.close()
+    return render_template('home_institucional.html', datos=datos, eventos=mis_eventos)
+
+@app.route('/crear_evento_oficial', methods=['POST'])
+def crear_evento_oficial():
+    if session.get('db_role') != 'rol_institucional': return redirect(url_for('login'))
+    
+    conn = get_db_connection_with_role()
+    cur = conn.cursor()
+    try:
+        # Insertamos el Evento (Estado 'publicado' directo porque es oficial)
+        cur.execute("""
+            INSERT INTO Evento (nombre, tipo, fechaHoraInicio, lugar, estado, descripcion)
+            VALUES (%s, %s, %s, %s, 'publicado', %s) RETURNING id_evento
+        """, (request.form['nombre'], request.form['tipo'], request.form['fecha'], request.form['lugar'], request.form['desc']))
+        id_ev = cur.fetchone()[0]
+        
+        # Nos registramos como Organizador (Permiso que acabamos de agregar en SQL)
+        cur.execute("INSERT INTO Organizador_Evento (id_evento, id_ente, rol) VALUES (%s, %s, 'Organizador')", (id_ev, session['user_id']))
+        
+        conn.commit()
+        flash("Evento institucional publicado exitosamente.")
+    except Exception as e:
+        conn.rollback()
+        flash(f"Error creando evento: {e}")
+    finally:
+        cur.close(); conn.close()
+    return redirect(url_for('home_institucional'))
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+--- FIN DE ARCHIVO: app.py ---
+============================================================
+
+--- INICIO DE ARCHIVO: config.py ---
+----------------------------------------
+
+--- FIN DE ARCHIVO: config.py ---
+============================================================
+
+--- INICIO DE ARCHIVO: contenido_proyecto_soyucab.txt ---
+----------------------------------------
+
+--- FIN DE ARCHIVO: contenido_proyecto_soyucab.txt ---
+============================================================
+
+--- INICIO DE ARCHIVO: db.py ---
+----------------------------------------
+# --- EN ARCHIVO: db.py ---
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+def get_db_connection():
+    try:
+        conn = psycopg2.connect(
+            host="localhost",
+            database="soyucab_db",
+            # CAMBIO AQUÍ: Usamos el usuario limitado, no postgres
+            user="app_backend",      
+            password="soyucab_pass", 
+            port="5432"
+        )
+        return conn
+    except Exception as e:
+        print(f"Error conectando a la BD: {e}")
+        return None
+--- FIN DE ARCHIVO: db.py ---
+============================================================
+
+--- INICIO DE ARCHIVO: exportar.py ---
+----------------------------------------
+import os
+
+# Configuración
+RUTA_PROYECTO = r'C:\Users\Alessi\Documents\BASES DE DATOS\Proyecto\SoyUCAB_App'
+ARCHIVO_SALIDA = 'contenido_proyecto_soyucab.txt'
+# Carpetas o extensiones a ignorar
+IGNORAR_CARPETAS = {'__pycache__', '.git', '.venv', 'node_modules'}
+EXTENSIONES_PERMITIDAS = {'.py', '.html', '.css', '.js', '.sql', '.txt'}
+
+def exportar_proyecto():
+    with open(ARCHIVO_SALIDA, 'w', encoding='utf-8') as f_salida:
+        f_salida.write(f"ESTRUCTURA Y CONTENIDO DEL PROYECTO: {os.path.basename(RUTA_PROYECTO)}\n")
+        f_salida.write("="*60 + "\n\n")
+
+        for raiz, carpetas, archivos in os.walk(RUTA_PROYECTO):
+            # Filtrar carpetas a ignorar
+            carpetas[:] = [d for d in carpetas if d not in IGNORAR_CARPETAS]
+
+            for nombre_archivo in archivos:
+                ruta_completa = os.path.join(raiz, nombre_archivo)
+                extension = os.path.splitext(nombre_archivo)[1]
+
+                # Solo procesar si es una extensión permitida
+                if extension in EXTENSIONES_PERMITIDAS:
+                    rel_path = os.path.relpath(ruta_completa, RUTA_PROYECTO)
+                    
+                    f_salida.write(f"\n--- INICIO DE ARCHIVO: {rel_path} ---\n")
+                    f_salida.write("-" * 40 + "\n")
+                    
+                    try:
+                        with open(ruta_completa, 'r', encoding='utf-8') as f_entrada:
+                            f_salida.write(f_entrada.read())
+                    except Exception as e:
+                        f_salida.write(f"[ERROR AL LEER EL ARCHIVO: {str(e)}]")
+                    
+                    f_salida.write(f"\n--- FIN DE ARCHIVO: {rel_path} ---\n")
+                    f_salida.write("="*60 + "\n")
+
+    print(f"Éxito: El contenido ha sido exportado a {ARCHIVO_SALIDA}")
+
+if __name__ == "__main__":
+    exportar_proyecto()
+--- FIN DE ARCHIVO: exportar.py ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\Query.sql ---
+----------------------------------------
+
+--- FIN DE ARCHIVO: BD\Query.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\Query_1.sql ---
+----------------------------------------
+-- Ponemos todos los posts en hora de Caracas de hoy domingo
+UPDATE Publica
+SET fechaPublicacion = CURRENT_TIMESTAMP AT TIME ZONE 'America/Caracas';
+--- FIN DE ARCHIVO: BD\Query_1.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\DDL\DDL E4.sql ---
+----------------------------------------
+-- 1. Ampliar el campo password para soportar hashes (Seguridad)
+ALTER TABLE Ente ALTER COLUMN password TYPE VARCHAR(255);
+
+-- 2. Convertir IDs en SERIAL (Elimina la necesidad de calcular MAX(id)+1)
+-- Nota: Hacemos esto para Ente y Publicacion
+CREATE SEQUENCE ente_id_seq OWNED BY ente.id_ente;
+ALTER TABLE Ente ALTER COLUMN id_ente SET DEFAULT nextval('ente_id_seq');
+
+CREATE SEQUENCE pub_id_seq OWNED BY publicacion.id_publicacion;
+ALTER TABLE Publicacion ALTER COLUMN id_publicacion SET DEFAULT nextval('pub_id_seq');
+
+-- Sincronizar secuencias con datos actuales
+SELECT setval('ente_id_seq', COALESCE(MAX(id_ente), 0) + 1) FROM Ente;
+SELECT setval('pub_id_seq', COALESCE(MAX(id_publicacion), 0) + 1) FROM Publicacion;
+
+-- Tabla para contabilizar los likes
+CREATE TABLE Reaccion (
+    id_publicacion INT,
+    id_ente INT,
+    fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id_publicacion, id_ente),
+    CONSTRAINT fk_reaccion_pub FOREIGN KEY (id_publicacion) REFERENCES Publicacion(id_publicacion) ON DELETE CASCADE,
+    CONSTRAINT fk_reaccion_ente FOREIGN KEY (id_ente) REFERENCES Ente(id_ente) ON DELETE CASCADE
+);
+
+-- 1. Crear tabla para Comentarios (Punto 7)
+CREATE TABLE Comentario (
+    id_comentario SERIAL PRIMARY KEY,
+    id_publicacion INT NOT NULL,
+    id_ente INT NOT NULL,
+    contenido TEXT NOT NULL,
+    fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_com_pub FOREIGN KEY (id_publicacion) REFERENCES Publicacion(id_publicacion) ON DELETE CASCADE,
+    CONSTRAINT fk_com_ente FOREIGN KEY (id_ente) REFERENCES Ente(id_ente) ON DELETE CASCADE
+);
+
+--- FIN DE ARCHIVO: BD\DDL\DDL E4.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\DDL\DDL JAVIER.sql ---
+----------------------------------------
+/* SCRIPT 1: ESTRUCTURA CORE (JAVIER) */
+
+-- 1. TABLA MAESTRA
+CREATE TABLE Ente (
+    id_ente INT PRIMARY KEY,
+    tipo VARCHAR(20) NOT NULL CHECK (tipo IN ('Persona', 'Dependencia', 'Organizacion')),
+    correoElectronico VARCHAR(100) NOT NULL UNIQUE,
+    password VARCHAR(100),
+    ubicacion_pais VARCHAR(50) NOT NULL,
+    ubicacion_estado VARCHAR(50) NOT NULL,
+    ubicacion_ciudad VARCHAR(50) NOT NULL,
+    direccion_detalle VARCHAR(150)
+);
+
+-- 2. SUBTIPOS
+CREATE TABLE Persona (
+    id_ente INT PRIMARY KEY,
+    CI INT NOT NULL UNIQUE,
+    nombre VARCHAR(50) NOT NULL,
+    apellido VARCHAR(50) NOT NULL,
+    fechaNacimiento DATE NOT NULL,
+    sexo CHAR(1) CHECK (sexo IN ('M', 'F')),
+    ocupacion VARCHAR(100),
+    estadoCuenta VARCHAR(20) DEFAULT 'activo' CHECK (estadoCuenta IN ('activo', 'suspendido', 'eliminado')),
+    CONSTRAINT fk_persona_ente FOREIGN KEY (id_ente) REFERENCES Ente(id_ente)
+);
+
+CREATE TABLE Dependencia_UCAB (
+    id_ente INT PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL UNIQUE,
+    tipoDependencia VARCHAR(50) CHECK (tipoDependencia IN ('Escuela', 'Facultad', 'CentroInvestigacion', 'Agrupacion', 'Secretariado')),
+    descripcion TEXT,
+    CONSTRAINT fk_dep_ente FOREIGN KEY (id_ente) REFERENCES Ente(id_ente)
+);
+
+CREATE TABLE Organizacion_Asociada (
+    id_ente INT PRIMARY KEY,
+    RIF VARCHAR(20) NOT NULL UNIQUE,
+    nombre VARCHAR(100) NOT NULL,
+    tipoOrganizacion VARCHAR(50) CHECK (tipoOrganizacion IN ('Fundacion', 'Empresa', 'Asociacion', 'Catedra')),
+    relacionConUCAB VARCHAR(100),
+    descripcion TEXT,
+    CONSTRAINT fk_org_ente FOREIGN KEY (id_ente) REFERENCES Ente(id_ente)
+);
+
+-- 3. PERFIL Y NEXOS
+CREATE TABLE Telefono (
+    numero VARCHAR(20),
+    id_ente_persona INT,
+    PRIMARY KEY (numero, id_ente_persona),
+    CONSTRAINT fk_tlf_persona FOREIGN KEY (id_ente_persona) REFERENCES Persona(id_ente)
+);
+
+CREATE TABLE Nexo_Institucional (
+    TAI VARCHAR(20) PRIMARY KEY,
+    tipoNexo VARCHAR(50) NOT NULL CHECK (tipoNexo IN ('Estudiante', 'Profesor', 'Empleado', 'Egresado')),
+    fechaInicio DATE NOT NULL,
+    fechaFin DATE,
+    estado VARCHAR(20) DEFAULT 'activo' CHECK (estado IN ('activo', 'inactivo', 'historico'))
+);
+
+CREATE TABLE Forma_Parte_De (
+    TAI VARCHAR(20) PRIMARY KEY,
+    id_persona INT NOT NULL,
+    id_dependencia INT NOT NULL,
+    CONSTRAINT fk_fpd_nexo FOREIGN KEY (TAI) REFERENCES Nexo_Institucional(TAI),
+    CONSTRAINT fk_fpd_persona FOREIGN KEY (id_persona) REFERENCES Persona(id_ente),
+    CONSTRAINT fk_fpd_dep FOREIGN KEY (id_dependencia) REFERENCES Dependencia_UCAB(id_ente)
+);
+
+CREATE TABLE Detalle_Nexo (
+    TAI_nexo VARCHAR(20),
+    clave VARCHAR(50),
+    valor VARCHAR(255) NOT NULL,
+    PRIMARY KEY (TAI_nexo, clave),
+    CONSTRAINT fk_detalle_padre FOREIGN KEY (TAI_nexo) REFERENCES Nexo_Institucional(TAI) ON DELETE CASCADE
+);
+
+-- 4. CATÁLOGOS
+CREATE TABLE Idioma (
+    nombre VARCHAR(50) PRIMARY KEY,
+    descripcion VARCHAR(255)
+);
+
+CREATE TABLE Habilidad_Tecnica (
+    nombre VARCHAR(50) PRIMARY KEY,
+    descripcion VARCHAR(255)
+);
+
+CREATE TABLE Area_De_Interes (
+    nombre VARCHAR(50) PRIMARY KEY,
+    descripcion VARCHAR(255)
+);
+
+CREATE TABLE Es_Dominado (
+    id_ente_persona INT,
+    nombre_idioma VARCHAR(50),
+    nivel VARCHAR(20) CHECK (nivel IN ('Basico', 'Intermedio', 'Avanzado', 'Nativo')),
+    PRIMARY KEY (id_ente_persona, nombre_idioma),
+    CONSTRAINT fk_dom_per FOREIGN KEY (id_ente_persona) REFERENCES Persona(id_ente),
+    CONSTRAINT fk_dom_idi FOREIGN KEY (nombre_idioma) REFERENCES Idioma(nombre)
+);
+
+CREATE TABLE Es_Poseida (
+    id_ente_persona INT,
+    nombre_habilidad VARCHAR(50),
+    PRIMARY KEY (id_ente_persona, nombre_habilidad),
+    CONSTRAINT fk_pos_per FOREIGN KEY (id_ente_persona) REFERENCES Persona(id_ente),
+    CONSTRAINT fk_pos_hab FOREIGN KEY (nombre_habilidad) REFERENCES Habilidad_Tecnica(nombre)
+);
+
+CREATE TABLE Es_Interesado (
+    id_ente_persona INT,
+    nombre_area VARCHAR(50),
+    prioridad INT CHECK (prioridad BETWEEN 1 AND 5),
+    PRIMARY KEY (id_ente_persona, nombre_area),
+    CONSTRAINT fk_int_per FOREIGN KEY (id_ente_persona) REFERENCES Persona(id_ente),
+    CONSTRAINT fk_int_area FOREIGN KEY (nombre_area) REFERENCES Area_De_Interes(nombre)
+);
+--- FIN DE ARCHIVO: BD\DDL\DDL JAVIER.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\DDL\DDL KEVIN.sql ---
+----------------------------------------
+/* SCRIPT 2: INTERACCIONES Y EVENTOS (KEVIN) */
+
+-- 1. GRUPOS
+CREATE TABLE Grupo (
+    id_grupo INT PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    descripcion TEXT,
+    tipoGrupo VARCHAR(20) NOT NULL CHECK (tipoGrupo IN ('publico', 'privado', 'secreto')),
+    fechaCreacion DATE NOT NULL DEFAULT CURRENT_DATE,
+    estado VARCHAR(20) NOT NULL DEFAULT 'activo' CHECK (estado IN ('activo', 'archivado'))
+);
+
+CREATE TABLE Membresia_Grupo (
+    id_grupo INT,
+    id_ente INT,
+    rol VARCHAR(20) NOT NULL CHECK (rol IN ('miembro', 'administrador', 'creador', 'moderador', 'Lider', 'Representante')),
+    fechaIngreso DATE NOT NULL DEFAULT CURRENT_DATE,
+    fechaSalida DATE,
+    estado VARCHAR(20) NOT NULL DEFAULT 'activo' CHECK (estado IN ('activo', 'suspendido', 'invitado', 'pendiente')),
+    PRIMARY KEY (id_grupo, id_ente),
+    CONSTRAINT fk_mem_grupo FOREIGN KEY (id_grupo) REFERENCES Grupo(id_grupo),
+    CONSTRAINT fk_mem_ente FOREIGN KEY (id_ente) REFERENCES Ente(id_ente)
+);
+
+-- 2. EVENTOS
+CREATE TABLE Evento (
+    id_evento INT PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    descripcion TEXT,
+    tipo VARCHAR(50) NOT NULL CHECK (tipo IN ('conferencia', 'taller', 'webinar', 'acto-grado')),
+    fechaHoraInicio TIMESTAMP NOT NULL,
+    fechaHoraFin TIMESTAMP,
+    lugar VARCHAR(100) NOT NULL,
+    estado VARCHAR(20) NOT NULL DEFAULT 'publicado' CHECK (estado IN ('borrador', 'publicado', 'en-curso', 'finalizado', 'archivado')),
+    cantidad_asistentes INT DEFAULT 0
+);
+
+CREATE TABLE Organizador_Evento (
+    id_evento INT,
+    id_ente INT,
+    rol VARCHAR(50),
+    fechaAsignacion DATE DEFAULT CURRENT_DATE,
+    PRIMARY KEY (id_evento, id_ente),
+    CONSTRAINT fk_org_ev_evento FOREIGN KEY (id_evento) REFERENCES Evento(id_evento),
+    CONSTRAINT fk_org_ev_ente FOREIGN KEY (id_ente) REFERENCES Ente(id_ente)
+);
+
+CREATE TABLE Asistencia_Evento (
+    id_evento INT,
+    id_ente_persona INT,
+    estadoRegistro VARCHAR(20) NOT NULL CHECK (estadoRegistro IN ('interesado', 'registrado', 'confirmado', 'asistio', 'cancelo')),
+    fechaRegistro DATE NOT NULL DEFAULT CURRENT_DATE,
+    fechaAsistencia DATE,
+    PRIMARY KEY (id_evento, id_ente_persona),
+    CONSTRAINT fk_asist_evento FOREIGN KEY (id_evento) REFERENCES Evento(id_evento),
+    CONSTRAINT fk_asist_persona FOREIGN KEY (id_ente_persona) REFERENCES Persona(id_ente)
+);
+
+CREATE TABLE Evento_Grupo (
+    id_evento INT PRIMARY KEY,
+    id_grupo INT NOT NULL,
+    CONSTRAINT fk_ev_grupo_ev FOREIGN KEY (id_evento) REFERENCES Evento(id_evento),
+    CONSTRAINT fk_ev_grupo_gr FOREIGN KEY (id_grupo) REFERENCES Grupo(id_grupo)
+);
+
+-- 3. INTERACCIONES SOCIALES
+CREATE TABLE Relacion (
+    id_ente1 INT,
+    id_ente2 INT,
+    tipo VARCHAR(20) NOT NULL CHECK (tipo IN ('amistad', 'tutoria', 'colaboracion', 'seguimiento', 'empleo', 'pasantia')),
+    direccionalidad VARCHAR(20) NOT NULL CHECK (direccionalidad IN ('simetrica', 'asimetrica')),
+    estado VARCHAR(20) NOT NULL DEFAULT 'pendiente' CHECK (estado IN ('pendiente', 'aceptada', 'rechazada', 'disuelta', 'bloqueada')),
+    fechaInicio DATE NOT NULL DEFAULT CURRENT_DATE,
+    fechaFin DATE,
+    observaciones TEXT,
+    PRIMARY KEY (id_ente1, id_ente2, tipo),
+    CONSTRAINT fk_rel_ente1 FOREIGN KEY (id_ente1) REFERENCES Ente(id_ente),
+    CONSTRAINT fk_rel_ente2 FOREIGN KEY (id_ente2) REFERENCES Ente(id_ente),
+    CONSTRAINT chk_no_self_rel CHECK (id_ente1 <> id_ente2)
+);
+
+CREATE TABLE Notificacion (
+    id_ente INT,
+    fechaEmision TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    tipo VARCHAR(50) NOT NULL CHECK (tipo IN ('Evento', 'comentario', 'solicitud Relacion', 'grupo', 'sistema')),
+    estado VARCHAR(20) NOT NULL DEFAULT 'no-leida' CHECK (estado IN ('leida', 'no-leida', 'archivada')),
+    contenidoResumen VARCHAR(255) NOT NULL,
+    tipoOrigen VARCHAR(50),
+    PRIMARY KEY (id_ente, fechaEmision),
+    CONSTRAINT fk_notif_ente FOREIGN KEY (id_ente) REFERENCES Ente(id_ente)
+);
+
+CREATE TABLE Publicacion (
+    id_publicacion INT PRIMARY KEY,
+    tipo VARCHAR(50) NOT NULL CHECK (tipo IN ('mensaje', 'archivo', 'encuesta', 'anuncio', 'oferta')),
+    contenidoTexto TEXT NOT NULL,
+    visibilidad VARCHAR(20) NOT NULL CHECK (visibilidad IN ('publica', 'solo-amigos', 'grupos', 'privada'))
+);
+
+CREATE TABLE Publica (
+    id_publicacion INT PRIMARY KEY,
+    id_ente INT NOT NULL,
+    fechaPublicacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_publica_pub FOREIGN KEY (id_publicacion) REFERENCES Publicacion(id_publicacion),
+    CONSTRAINT fk_publica_ente FOREIGN KEY (id_ente) REFERENCES Ente(id_ente)
+);
+
+CREATE TABLE Esta_Suscrito (
+    id_ente INT,
+    id_grupo INT,
+    fechaSuscripcion DATE DEFAULT CURRENT_DATE,
+    PRIMARY KEY (id_ente, id_grupo),
+    FOREIGN KEY (id_ente) REFERENCES Ente(id_ente),
+    FOREIGN KEY (id_grupo) REFERENCES Grupo(id_grupo)
+);
+--- FIN DE ARCHIVO: BD\DDL\DDL KEVIN.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\LOGICA DE NEGOCIO\LOGICA DE NEGOCIO.sql ---
+----------------------------------------
+-- LÓGICA DE NEGOCIO (FUNCTIONS, PROCEDURES)
+
+-- [JAVIER] SP Notificar Evento
+CREATE OR REPLACE PROCEDURE sp_notificar_evento_grupo(p_id_evento INT, p_id_grupo INT)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_nombre_evento VARCHAR(100);
+    v_miembro RECORD;
+BEGIN
+    SELECT nombre INTO v_nombre_evento FROM Evento WHERE id_evento = p_id_evento;
+    FOR v_miembro IN SELECT id_ente FROM Membresia_Grupo WHERE id_grupo = p_id_grupo AND estado = 'activo' LOOP
+        INSERT INTO Notificacion (id_ente, fechaEmision, tipo, estado, contenidoResumen, tipoOrigen)
+        VALUES (v_miembro.id_ente, NOW(), 'Evento', 'no-leida', 'Nuevo evento: ' || v_nombre_evento, 'Sistema');
+    END LOOP;
+END;
+$$;
+
+-- [JAVIER] Función Verificar Ente
+CREATE OR REPLACE FUNCTION fn_verificar_ente_institucional(p_id_ente INT)
+RETURNS BOOLEAN AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM Dependencia_UCAB WHERE id_ente = p_id_ente)
+       OR EXISTS (SELECT 1 FROM Organizacion_Asociada WHERE id_ente = p_id_ente) THEN
+        RETURN TRUE;
+    ELSE
+        RETURN FALSE;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- [KEVIN] SP Gestionar Suscripción
+CREATE OR REPLACE PROCEDURE sp_gestionar_suscripcion(p_id_ente INT, p_id_grupo INT)
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM Esta_Suscrito WHERE id_ente = p_id_ente AND id_grupo = p_id_grupo) THEN
+        DELETE FROM Esta_Suscrito WHERE id_ente = p_id_ente AND id_grupo = p_id_grupo;
+    ELSE
+        INSERT INTO Esta_Suscrito (id_ente, id_grupo) VALUES (p_id_ente, p_id_grupo);
+    END IF;
+END;
+$$;
+
+-- [KEVIN] Función Antigüedad
+CREATE OR REPLACE FUNCTION fn_calcular_antiguedad_miembro(p_id_ente INT, p_id_grupo INT)
+RETURNS INT AS $$
+DECLARE
+    v_fecha_ingreso DATE;
+    v_meses INT;
+BEGIN
+    SELECT fechaIngreso INTO v_fecha_ingreso FROM Membresia_Grupo WHERE id_ente = p_id_ente AND id_grupo = p_id_grupo;
+    IF v_fecha_ingreso IS NULL THEN RETURN 0; END IF;
+    SELECT (EXTRACT(YEAR FROM age(NOW(), v_fecha_ingreso)) * 12 + EXTRACT(MONTH FROM age(NOW(), v_fecha_ingreso))) INTO v_meses;
+    RETURN v_meses;
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+SELECT * FROM Notificacion WHERE contenidoResumen LIKE '%Feria%';
+CALL sp_notificar_evento_grupo(600, 1);
+--- FIN DE ARCHIVO: BD\LOGICA DE NEGOCIO\LOGICA DE NEGOCIO.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\POBLACION\POBLACION.sql ---
+----------------------------------------
+/* ==============================================================
+ * SCRIPT MAESTRO "FULL DATA" - CORREGIDO
+ * ============================================================== */
+
+-- 0. LIMPIEZA NUCLEAR (Agregada tabla Nexo_Institucional y Telefono explícitamente)
+TRUNCATE TABLE
+    Ente,
+    Nexo_Institucional,
+    Grupo,
+    Evento,
+    Publicacion,
+    Idioma,
+    Habilidad_Tecnica,
+    Area_De_Interes
+RESTART IDENTITY CASCADE;
+
+-- ==============================================================
+-- 1. IDENTIDAD
+-- ==============================================================
+INSERT INTO Ente (id_ente, tipo, correoElectronico, ubicacion_pais, ubicacion_estado, ubicacion_ciudad, direccion_detalle) VALUES
+-- DEPENDENCIAS
+(100, 'Dependencia', 'ingenieria@ucab.edu.ve', 'Venezuela', 'Bolivar', 'Guayana', 'Edif. Ciencias'),
+(101, 'Dependencia', 'derecho@ucab.edu.ve', 'Venezuela', 'Distrito Capital', 'Caracas', 'Cincuentenario'),
+(102, 'Dependencia', 'cultura@ucab.edu.ve', 'Venezuela', 'Distrito Capital', 'Caracas', 'Aula Magna'),
+(103, 'Dependencia', 'deportes@ucab.edu.ve', 'Venezuela', 'Miranda', 'Caracas', 'Gimnasio'),
+-- ORGANIZACIONES
+(200, 'Organizacion', 'polar@empresas.com', 'Venezuela', 'Miranda', 'Caracas', 'Los Cortijos'),
+(201, 'Organizacion', 'nestle@empresas.com', 'Venezuela', 'Aragua', 'Fabrica', 'Zona Industrial'),
+(202, 'Organizacion', 'bancaribe@banco.com', 'Venezuela', 'Distrito Capital', 'Chacao', 'Torre B'),
+(203, 'Organizacion', 'google@tech.com', 'USA', 'California', 'Mountain View', 'Plex'),
+-- ESTUDIANTES
+(1, 'Persona', 'javier@est.ucab.edu.ve', 'Venezuela', 'Miranda', 'Caracas', 'Montalban'),
+(2, 'Persona', 'kevin@est.ucab.edu.ve', 'Venezuela', 'Distrito Capital', 'Caracas', 'El Paraiso'),
+(3, 'Persona', 'fredi@est.ucab.edu.ve', 'Venezuela', 'La Guaira', 'Caribe', 'Av Principal'),
+(4, 'Persona', 'maria.perez@est.ucab.edu.ve', 'Venezuela', 'Miranda', 'San Antonio', 'Recta'),
+(5, 'Persona', 'jose.gomez@est.ucab.edu.ve', 'Venezuela', 'Distrito Capital', 'Caracas', 'Centro'),
+(6, 'Persona', 'ana.rodriguez@est.ucab.edu.ve', 'Venezuela', 'Miranda', 'Chacao', 'El Rosal'),
+(7, 'Persona', 'sofia.martinez@est.ucab.edu.ve', 'Venezuela', 'Miranda', 'Baruta', 'Las Mercedes'),
+(8, 'Persona', 'carlos.lopez@est.ucab.edu.ve', 'Venezuela', 'Miranda', 'Hatillo', 'Oripoto'),
+(9, 'Persona', 'luis.fernandez@est.ucab.edu.ve', 'Venezuela', 'Bolivar', 'Puerto Ordaz', 'Alta Vista'),
+(10, 'Persona', 'andrea.torres@est.ucab.edu.ve', 'Venezuela', 'Bolivar', 'San Felix', 'Centro'),
+-- PROFESORES Y PERSONAL
+(30, 'Persona', 'marlene.goncalves@ucab.edu.ve', 'Venezuela', 'La Guaira', 'Catia la Mar', 'Res. Playa'),
+(31, 'Persona', 'patricia.wilthew@ucab.edu.ve', 'Venezuela', 'Distrito Capital', 'Caracas', 'Urb. Avila'),
+(32, 'Persona', 'oscar.perez@ucab.edu.ve', 'Venezuela', 'Miranda', 'Caracas', 'Santa Fe'),
+(33, 'Persona', 'yosly.hernandez@ucab.edu.ve', 'Venezuela', 'Miranda', 'Caracas', 'La Trinidad'),
+(34, 'Persona', 'jonas.montilva@ucab.edu.ve', 'Venezuela', 'Merida', 'Merida', 'La Hechicera'),
+(35, 'Persona', 'carlos.suarez@ucab.edu.ve', 'Venezuela', 'Distrito Capital', 'Caracas', 'San Bernardino'),
+(36, 'Persona', 'empleado.juan@ucab.edu.ve', 'Venezuela', 'Miranda', 'Guarenas', 'Villa Panamericana'),
+(37, 'Persona', 'empleada.elena@ucab.edu.ve', 'Venezuela', 'Miranda', 'Guatire', 'Castillejo'),
+-- EGRESADOS
+(50, 'Persona', 'pedro.tutor@gmail.com', 'España', 'Madrid', 'Madrid', 'Centro'),
+(51, 'Persona', 'luisa.ingeniera@tech.com', 'USA', 'Florida', 'Miami', 'Brickell'),
+(52, 'Persona', 'miguel.gerente@banco.com', 'Panama', 'Panama', 'Costa del Este', 'Torre B'),
+(53, 'Persona', 'andres.consultor@big4.com', 'Chile', 'Santiago', 'Las Condes', 'Golf');
+
+-- ==============================================================
+-- 2. DETALLES SUBTIPOS
+-- ==============================================================
+INSERT INTO Dependencia_UCAB (id_ente, nombre, tipoDependencia) VALUES
+(100, 'Escuela Ingeniería Informática', 'Escuela'),
+(101, 'Escuela de Derecho', 'Escuela'),
+(102, 'Dirección de Cultura', 'Agrupacion'),
+(103, 'Dirección de Deportes', 'Agrupacion');
+
+INSERT INTO Organizacion_Asociada (id_ente, RIF, nombre, tipoOrganizacion) VALUES
+(200, 'J-00001234-5', 'Empresas Polar', 'Empresa'),
+(201, 'J-55554444-1', 'Nestlé Venezuela', 'Empresa'),
+(202, 'J-99998888-2', 'Bancaribe', 'Empresa'),
+(203, 'Ext-001122', 'Google LLC', 'Empresa');
+
+-- Personas
+INSERT INTO Persona (id_ente, CI, nombre, apellido, fechaNacimiento, sexo, ocupacion) VALUES
+(1, 28111001, 'Javier', 'Di Addezio', '2002-05-20', 'M', 'Estudiante'),
+(2, 29111002, 'Kevin', 'Lopez', '2003-08-15', 'M', 'Estudiante'),
+(3, 27111003, 'Fredi', 'Airanji', '2001-02-10', 'M', 'Estudiante'),
+(4, 30111004, 'Maria', 'Perez', '2004-12-01', 'F', 'Estudiante'),
+(5, 30111005, 'Jose', 'Gomez', '2004-01-20', 'M', 'Estudiante'),
+(6, 29111006, 'Ana', 'Rodriguez', '2003-05-15', 'F', 'Estudiante'),
+(7, 28111007, 'Sofia', 'Martinez', '2002-11-11', 'F', 'Estudiante'),
+(8, 28111008, 'Carlos', 'Lopez', '2002-07-07', 'M', 'Estudiante'),
+(9, 26111009, 'Luis', 'Fernandez', '2001-03-03', 'M', 'Estudiante'),
+(10, 27111010, 'Andrea', 'Torres', '2002-09-09', 'F', 'Estudiante'),
+(30, 10111000, 'Marlene', 'Goncalves', '1980-01-01', 'F', 'Profesor Titular'),
+(31, 11111000, 'Patricia', 'Wilthew', '1982-05-05', 'F', 'Director Escuela'),
+(32, 12111000, 'Oscar', 'Perez', '1975-09-09', 'M', 'Investigador'),
+(33, 13111000, 'Yosly', 'Hernandez', '1978-04-14', 'F', 'Coordinador Pasantías'),
+(34, 14111000, 'Jonas', 'Montilva', '1960-11-20', 'M', 'Profesor Doctor'),
+(35, 15111000, 'Carlos', 'Suarez', '1985-02-28', 'M', 'Profesor Hora'),
+(36, 18111000, 'Juan', 'Martinez', '1990-06-15', 'M', 'Técnico Soporte'),
+(37, 19111000, 'Elena', 'Rivas', '1992-08-20', 'F', 'Secretaria Académica'),
+(50, 15111999, 'Pedro', 'Ramirez', '1992-06-15', 'M', 'Consultor Senior'),
+(51, 16111999, 'Luisa', 'Fernandez', '1993-03-30', 'F', 'Tech Lead'),
+(52, 17111999, 'Miguel', 'Torres', '1990-12-12', 'M', 'Gerente'),
+(53, 17222999, 'Andres', 'Bello', '1989-10-10', 'M', 'Arquitecto Cloud');
+
+-- ==============================================================
+-- 3. NEXOS Y EXTENSIBILIDAD
+-- ==============================================================
+INSERT INTO Nexo_Institucional (TAI, tipoNexo, fechaInicio, estado) VALUES
+('TAI-PROF-01', 'Profesor', '1990-01-01', 'activo'),
+('TAI-PROF-02', 'Profesor', '2005-09-01', 'activo'),
+('TAI-PROF-03', 'Profesor', '2010-03-15', 'activo'),
+('TAI-PROF-04', 'Profesor', '2015-01-10', 'activo'),
+('TAI-PROF-05', 'Profesor', '2022-09-01', 'activo'),
+('TAI-PROF-06', 'Profesor', '2023-09-01', 'activo'),
+('TAI-EMP-01', 'Empleado', '2018-05-01', 'activo'),
+('TAI-EMP-02', 'Empleado', '2019-11-01', 'activo'),
+('TAI-STD-01', 'Estudiante', '2020-09-15', 'activo'),
+('TAI-STD-02', 'Estudiante', '2020-09-15', 'activo'),
+('TAI-STD-03', 'Estudiante', '2021-03-01', 'activo'),
+('TAI-STD-04', 'Estudiante', '2021-03-01', 'activo'),
+('TAI-STD-05', 'Estudiante', '2022-09-15', 'activo'),
+('TAI-STD-06', 'Estudiante', '2022-09-15', 'activo'),
+('TAI-STD-07', 'Estudiante', '2023-03-01', 'activo'),
+('TAI-STD-08', 'Estudiante', '2023-03-01', 'activo'),
+('TAI-STD-09', 'Estudiante', '2024-09-01', 'activo'),
+('TAI-STD-10', 'Estudiante', '2024-09-01', 'activo'),
+('TAI-EGR-01', 'Egresado', '2014-07-30', 'historico'),
+('TAI-EGR-02', 'Egresado', '2016-07-30', 'historico'),
+('TAI-EGR-03', 'Egresado', '2013-07-30', 'historico'),
+('TAI-EGR-04', 'Egresado', '2012-07-30', 'historico');
+
+INSERT INTO Forma_Parte_De (TAI, id_persona, id_dependencia) VALUES
+('TAI-PROF-01', 34, 100),
+('TAI-PROF-02', 30, 100),
+('TAI-PROF-03', 31, 100),
+('TAI-PROF-04', 33, 100),
+('TAI-PROF-05', 32, 100),
+('TAI-PROF-06', 35, 100),
+('TAI-EMP-01', 36, 100),
+('TAI-EMP-02', 37, 101),
+('TAI-STD-01', 1, 100),
+('TAI-STD-02', 2, 100),
+('TAI-STD-03', 3, 100),
+('TAI-STD-04', 4, 100),
+('TAI-STD-05', 5, 100),
+('TAI-STD-06', 6, 100),
+('TAI-STD-07', 7, 101),
+('TAI-STD-08', 8, 101),
+('TAI-STD-09', 9, 100),
+('TAI-STD-10', 10, 100),
+('TAI-EGR-01', 50, 100),
+('TAI-EGR-02', 51, 100),
+('TAI-EGR-03', 52, 100),
+('TAI-EGR-04', 53, 100);
+
+INSERT INTO Detalle_Nexo (TAI_nexo, clave, valor) VALUES
+('TAI-EGR-01', 'Promedio', '18.5'),
+('TAI-EGR-02', 'Promedio', '19.2'),
+('TAI-EGR-03', 'Promedio', '16.0'),
+('TAI-EGR-04', 'Promedio', '17.8'),
+('TAI-PROF-01', 'Escalafon', 'Titular'),
+('TAI-PROF-02', 'Escalafon', 'Titular'),
+('TAI-PROF-03', 'Escalafon', 'Asociado');
+
+-- ==============================================================
+-- 4. GRUPOS Y MEMBRESÍAS
+-- ==============================================================
+INSERT INTO Grupo (id_grupo, nombre, tipoGrupo, descripcion) VALUES
+(1, 'Agrupación de Robótica', 'publico', 'Tech'),
+(2, 'Centro de Estudiantes', 'publico', 'Politica'),
+(3, 'Club de Debate', 'privado', 'Oratoria'),
+(4, 'Selección de Fútbol', 'publico', 'Deportes'),
+(5, 'Modelado Naciones Unidas', 'privado', 'MUN');
+
+INSERT INTO Membresia_Grupo (id_grupo, id_ente, rol) VALUES
+(1, 1, 'Lider'),
+(1, 2, 'miembro'),
+(1, 3, 'miembro'),
+(1, 5, 'miembro'),
+(1, 9, 'miembro'),
+(2, 2, 'Lider'),
+(2, 4, 'miembro'),
+(2, 6, 'miembro'),
+(3, 8, 'Lider'),
+(3, 7, 'miembro'),
+(4, 9, 'Lider'),
+(5, 10, 'Lider'),
+(5, 1, 'miembro'),
+(5, 6, 'miembro'),
+(5, 7, 'miembro'),
+(5, 8, 'miembro');
+
+-- ==============================================================
+-- 5. EVENTOS
+-- ==============================================================
+INSERT INTO Evento (id_evento, nombre, tipo, fechaHoraInicio, fechaHoraFin, lugar, estado) VALUES
+(500, 'Taller SQL', 'taller', '2023-01-10 08:00:00', '2023-01-10 12:00:00', 'Lab 1', 'finalizado'),
+(501, 'Intro a Python', 'taller', '2023-02-15 09:00:00', '2023-02-15 14:00:00', 'Lab 2', 'finalizado'),
+(502, 'Foro de DDHH', 'conferencia', '2023-03-20 08:00:00', '2023-03-20 18:00:00', 'Auditorio', 'finalizado'),
+(600, 'Feria de Empleo', 'conferencia', '2025-12-20 09:00:00', NULL, 'Plaza', 'publicado'),
+(601, 'Acto de Grado', 'acto-grado', '2025-11-30 10:00:00', NULL, 'Aula Magna', 'publicado'),
+(602, 'Torneo de Robots', 'conferencia', '2026-01-15 08:00:00', NULL, 'Cancha', 'publicado'),
+(603, 'Charla de IA', 'webinar', '2025-10-15 15:00:00', NULL, 'Zoom', 'publicado'),
+(604, 'Copa UCAB', 'conferencia', '2026-02-01 08:00:00', NULL, 'Estadio', 'borrador');
+
+INSERT INTO Organizador_Evento (id_evento, id_ente, rol) VALUES
+(500, 30, 'Facilitador'),
+(502, 30, 'Moderador'),
+(603, 30, 'Ponente'),
+(501, 31, 'Facilitador'),
+(600, 200, 'Patrocinante'),
+(602, 1, 'Organizador');
+
+INSERT INTO Evento_Grupo (id_evento, id_grupo) VALUES
+(500, 1),
+(602, 1),
+(501, 1),
+(502, 2),
+(603, 1),
+(604, 4);
+
+INSERT INTO Asistencia_Evento (id_evento, id_ente_persona, estadoRegistro) VALUES
+(500, 1, 'asistio'),
+(500, 2, 'asistio'),
+(500, 3, 'asistio'),
+(600, 50, 'registrado'),
+(600, 51, 'registrado');
+
+-- ==============================================================
+-- 6. INTERACCIONES
+-- ==============================================================
+INSERT INTO Relacion (id_ente1, id_ente2, tipo, direccionalidad, estado, fechaInicio) VALUES
+(50, 1, 'tutoria', 'asimetrica', 'aceptada', '2023-01-01'),
+(51, 2, 'tutoria', 'asimetrica', 'aceptada', '2023-02-01'),
+(53, 3, 'tutoria', 'asimetrica', 'aceptada', '2023-03-01');
+
+INSERT INTO Telefono (numero, id_ente_persona) VALUES
+('04140000000', 1);
+
+INSERT INTO Idioma (nombre) VALUES
+('Ingles');
+
+INSERT INTO Habilidad_Tecnica (nombre, descripcion) VALUES
+('Java'),
+('SQL', 'Manejo de bases de datos relacionales'),
+('Python', 'Programación backend'),
+('Flask', 'Desarrollo web microframework'),
+('PostgreSQL', 'Administración avanzada de BD');
+
+INSERT INTO Area_De_Interes (nombre) VALUES
+('IA');
+
+INSERT INTO Esta_Suscrito (id_ente, id_grupo) VALUES
+(1, 2);
+
+INSERT INTO Publicacion (id_publicacion, tipo, contenidoTexto, visibilidad) VALUES
+(1, 'anuncio', 'Hola', 'publica');
+
+INSERT INTO Publica (id_publicacion, id_ente) VALUES
+(1, 1);
+
+INSERT INTO Notificacion (id_ente, tipo, contenidoResumen) VALUES
+(1, 'sistema', 'Hola');
+--- FIN DE ARCHIVO: BD\POBLACION\POBLACION.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\REPORTES\REPORTES.sql ---
+----------------------------------------
+-- ================= [ JAVIER ] =================
+
+-- 1. RANKING DE POPULARIDAD DE GRUPOS
+SELECT
+    G.nombre AS "Nombre Grupo",
+    COUNT(M.id_ente) AS "Miembros",
+    -- Cálculo de porcentaje simple
+    CAST(COUNT(M.id_ente) * 100.0 / (SELECT COUNT(*) FROM Persona) AS DECIMAL(5,2)) || '%' AS "Popularidad"
+FROM Grupo G
+LEFT JOIN Membresia_Grupo M ON G.id_grupo = M.id_grupo
+GROUP BY G.id_grupo, G.nombre
+ORDER BY "Miembros" DESC;
+
+
+-- 2. GRUPOS MÁS ACTIVOS (Eventos organizados)
+SELECT
+    G.nombre AS "Grupo",
+    COUNT(EG.id_evento) AS "Eventos",
+    CASE
+        WHEN COUNT(EG.id_evento) >= 2 THEN 'Muy Activo'
+        WHEN COUNT(EG.id_evento) = 1 THEN 'Regular'
+        ELSE 'Sin Actividad'
+    END AS "Estatus"
+FROM Grupo G
+LEFT JOIN Evento_Grupo EG ON G.id_grupo = EG.id_grupo
+GROUP BY G.nombre
+ORDER BY "Eventos" DESC;
+
+
+-- (Busca personas con Nexo 'Profesor' que organicen eventos)
+-- 3. DOCENTES CON MÁS HORAS DICTADAS
+SELECT
+    P.nombre || ' ' || P.apellido AS "Docente",
+    COUNT(E.id_evento) AS "Cant. Eventos",
+    SUM(EXTRACT(EPOCH FROM (E.fechaHoraFin - E.fechaHoraInicio))/3600) AS "Horas Totales"
+FROM Persona P
+JOIN Forma_Parte_De FPD ON P.id_ente = FPD.id_persona
+JOIN Nexo_Institucional N ON FPD.TAI = N.TAI
+JOIN Organizador_Evento OE ON P.id_ente = OE.id_ente
+JOIN Evento E ON OE.id_evento = E.id_evento
+WHERE N.tipoNexo = 'Profesor'
+GROUP BY P.id_ente, P.nombre, P.apellido;
+
+
+-- ================= [ KEVIN ] =================
+
+-- 1. PERSONAL MÁS ANTIGUO (Profesores y Empleados)
+SELECT
+    P.nombre || ' ' || P.apellido AS "Personal",
+    N.tipoNexo AS "Cargo",
+    N.fechaInicio AS "Fecha Ingreso",
+    -- Calcula años de servicio
+    EXTRACT(YEAR FROM AGE(CURRENT_DATE, N.fechaInicio)) || ' Años' AS "Antigüedad"
+FROM Nexo_Institucional N
+JOIN Forma_Parte_De FPD ON N.TAI = FPD.TAI
+JOIN Persona P ON FPD.id_persona = P.id_ente
+WHERE N.tipoNexo IN ('Profesor', 'Empleado')
+ORDER BY N.fechaInicio;
+
+
+-- (Este requiere que Pedro sea Tutor de alguien)
+-- 2. EGRESADOS QUE SON TUTORES
+SELECT
+    P.nombre || ' ' || P.apellido AS "Egresado Tutor",
+    DN.valor AS "Promedio Graduación",
+    R.fechaInicio AS "Inicio Tutoría"
+FROM Persona P
+-- 1. Unimos con su Nexo para validar que sea Egresado
+JOIN Forma_Parte_De FPD ON P.id_ente = FPD.id_persona
+JOIN Nexo_Institucional N ON FPD.TAI = N.TAI
+-- 2. Unimos con Detalle para ver el promedio
+JOIN Detalle_Nexo DN ON N.TAI = DN.TAI_nexo
+-- 3. Unimos con Relacion para ver si es Tutor (id_ente1 = Tutor)
+JOIN Relacion R ON P.id_ente = R.id_ente1
+WHERE N.tipoNexo = 'Egresado'
+  AND DN.clave = 'Promedio'
+  AND R.tipo = 'tutoria';
+
+
+-- 3. CALENDARIO DE EVENTOS PÚBLICOS
+SELECT
+    E.nombre AS "Evento",
+    E.lugar AS "Ubicación",
+    E.fechaHoraInicio AS "Fecha",
+    E.estado AS "Estado"
+FROM Evento E
+WHERE E.estado = 'publicado'
+ORDER BY E.fechaHoraInicio DESC;
+--- FIN DE ARCHIVO: BD\REPORTES\REPORTES.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\SEGURIDAD\PRUEBA ROLES 1.sql ---
+----------------------------------------
+-- 1. Cambiamos de identidad a Javier
+SET ROLE user_javier;
+SET app.current_ente_id = '1'; -- Simulamos que el backend nos identificó como ID 1
+
+-- 2. Prueba de Lectura (Notificaciones)
+-- DEBERÍA: Mostrar solo las notificaciones donde id_ente = 1
+SELECT * FROM Notificacion;
+
+-- 3. Prueba de Escritura Ilegal (Teléfono de otro)
+-- Intentamos borrar el teléfono de Kevin (ID 2)
+-- DEBERÍA: Ejecutarse sin error pero decir "0 rows affected" (la política se lo oculta)
+DELETE FROM Telefono WHERE id_ente_persona = 2;
+
+-- 4. Prueba de Escritura Legal (Su propio teléfono)
+-- DEBERÍA: Funcionar correctamente
+UPDATE Telefono SET numero = '0414-NUEVO' WHERE id_ente_persona = 1;
+
+---------------------------------------------------------------------------------------------
+
+SELECT
+    current_user;
+--- FIN DE ARCHIVO: BD\SEGURIDAD\PRUEBA ROLES 1.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\SEGURIDAD\PRUEBA ROLES 2.sql ---
+----------------------------------------
+-- 1. Cambiamos de identidad a la Escuela
+SET ROLE user_escuela;
+SET app.current_ente_id = '100'; -- ID de la Escuela de Informática
+
+-- 2. Prueba de Lectura (Eventos)
+-- DEBERÍA: Mostrar solo eventos organizados por la ID 100.
+-- Si ves eventos de otras escuelas, la política falló.
+SELECT * FROM Evento;
+
+-- 3. Prueba de Inserción (Nuevo Evento)
+-- DEBERÍA: Permitirlo
+INSERT INTO Evento (id_evento, nombre, tipo, fechaHoraInicio, lugar, estado)
+VALUES (999, 'Evento Privado Escuela', 'taller', NOW(), 'Lab', 'borrador');
+
+-- IMPORTANTE: Para que la política te deje ver este nuevo evento,
+-- debes insertarte también como organizador inmediatamente (en una app real es una transacción)
+-- Nota: Como user_escuela no tiene permiso directo en Organizador_Evento para escribir,
+-- esta parte suele hacerla un SP con permisos elevados definidos con SECURITY DEFINER.
+-- Para esta prueba simple, el SELECT de arriba es suficiente para validar la visión.
+--- FIN DE ARCHIVO: BD\SEGURIDAD\PRUEBA ROLES 2.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\SEGURIDAD\PRUEBA ROLES 3.sql ---
+----------------------------------------
+-- 1. Cambiamos de identidad al Auditor
+SET ROLE user_auditor;
+-- (El auditor no necesita app.current_ente_id porque no tiene datos propios)
+
+-- 2. Prueba de Acceso Prohibido
+-- DEBERÍA: Dar error rojo "permission denied for table persona"
+SELECT * FROM Persona;
+
+-- 3. Prueba de Acceso Permitido (Vistas)
+-- DEBERÍA: Mostrar la tabla de resumen estadístico
+SELECT * FROM vw_estadisticas_anonimas;
+--- FIN DE ARCHIVO: BD\SEGURIDAD\PRUEBA ROLES 3.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\SEGURIDAD\ROLES.sql ---
+----------------------------------------
+/* ==========================================================================
+ * SCRIPT DEFINITIVO DE SEGURIDAD (SoyUCAB) - VERSIÓN BLINDADA
+ * ========================================================================== */
+
+SET ROLE postgres;
+
+-- ==========================================================================
+-- 0. FASE DE LIMPIEZA NUCLEAR (SAFE MODE)
+-- ==========================================================================
+
+-- 1. REVOCAR PERMISOS DE CONEXIÓN SI LOS ROLES EXISTEN
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'rol_usuario_comun') THEN
+        REVOKE ALL PRIVILEGES ON DATABASE soyucab_db FROM rol_usuario_comun;
+    END IF;
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'rol_institucional') THEN
+        REVOKE ALL PRIVILEGES ON DATABASE soyucab_db FROM rol_institucional;
+    END IF;
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'rol_auditor') THEN
+        REVOKE ALL PRIVILEGES ON DATABASE soyucab_db FROM rol_auditor;
+    END IF;
+END $$;
+
+-- 2. BORRAR TODAS LAS POLÍTICAS DE SEGURIDAD (RLS) EXISTENTES
+-- (Esto libera a los roles de sus ataduras)
+
+-- Políticas de Usuario Común
+DROP POLICY IF EXISTS policy_persona_propia ON Persona;
+DROP POLICY IF EXISTS policy_telefono_propio ON Telefono;
+DROP POLICY IF EXISTS policy_ver_personas_publico ON Persona;
+DROP POLICY IF EXISTS policy_crear_publicacion ON Publicacion;
+DROP POLICY IF EXISTS policy_borrar_publicacion ON Publicacion;
+DROP POLICY IF EXISTS policy_ver_publicaciones ON Publicacion;
+DROP POLICY IF EXISTS policy_editar_ente_propio ON Ente;
+DROP POLICY IF EXISTS policy_ver_entes_publicos ON Ente;
+DROP POLICY IF EXISTS policy_registro_ente ON Ente;
+DROP POLICY IF EXISTS policy_registro_persona ON Persona;
+DROP POLICY IF EXISTS policy_mis_habilidades ON Es_Poseida;
+DROP POLICY IF EXISTS policy_actualizar_notificacion_propia ON Notificacion;
+DROP POLICY IF EXISTS policy_crear_notificacion ON Notificacion;
+DROP POLICY IF EXISTS policy_ver_mis_notificaciones ON Notificacion;
+DROP POLICY IF EXISTS policy_mis_notificaciones ON Notificacion;
+DROP POLICY IF EXISTS policy_ver_eventos_publicos ON Evento;
+DROP POLICY IF EXISTS policy_gestionar_asistencia ON Asistencia_Evento;
+DROP POLICY IF EXISTS policy_gestionar_membresia ON Membresia_Grupo;
+DROP POLICY IF EXISTS policy_ver_relaciones ON Relacion;
+DROP POLICY IF EXISTS policy_crear_relacion ON Relacion;
+DROP POLICY IF EXISTS policy_aceptar_relacion ON Relacion;
+DROP POLICY IF EXISTS policy_borrar_relacion ON Relacion;
+
+-- Políticas Institucionales
+DROP POLICY IF EXISTS policy_mis_eventos ON Evento;
+DROP POLICY IF EXISTS policy_crear_evento_institucional ON Evento;
+DROP POLICY IF EXISTS policy_gestionar_mis_eventos ON Evento;
+DROP POLICY IF EXISTS policy_institucional_eventos ON Evento;
+DROP POLICY IF EXISTS policy_institucional_insert ON Evento;
+DROP POLICY IF EXISTS policy_institucional_select ON Evento;
+DROP POLICY IF EXISTS policy_institucional_modificar ON Evento;
+DROP POLICY IF EXISTS policy_institucional_borrar ON Evento;
+DROP POLICY IF EXISTS policy_ver_mi_dependencia ON Dependencia_UCAB;
+DROP POLICY IF EXISTS policy_ver_mi_organizacion ON Organizacion_Asociada;
+DROP POLICY IF EXISTS policy_ver_ente_inst ON Ente;
+DROP POLICY IF EXISTS policy_ver_ente_institucional ON Ente;
+
+-- 3. DESARMAR Y BORRAR USUARIO BACKEND
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_backend') THEN
+        REVOKE ALL PRIVILEGES ON SCHEMA public FROM app_backend;
+        REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM app_backend;
+        REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM app_backend;
+        REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM app_backend;
+    END IF;
+END $$;
+DROP USER IF EXISTS app_backend;
+
+-- 4. BORRAR ROLES ANTIGUOS
+DROP ROLE IF EXISTS user_javier;
+DROP ROLE IF EXISTS user_escuela;
+DROP ROLE IF EXISTS user_auditor;
+
+-- 5. BORRAR ROLES PRINCIPALES (CON CHECK DE EXISTENCIA)
+DO $$
+BEGIN
+    -- Rol Usuario Común
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'rol_usuario_comun') THEN
+        DROP OWNED BY rol_usuario_comun;
+        DROP ROLE rol_usuario_comun;
+    END IF;
+
+    -- Rol Institucional
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'rol_institucional') THEN
+        DROP OWNED BY rol_institucional;
+        DROP ROLE rol_institucional;
+    END IF;
+
+    -- Rol Auditor
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'rol_auditor') THEN
+        DROP OWNED BY rol_auditor;
+        DROP ROLE rol_auditor;
+    END IF;
+
+    -- Rol Admin DBA
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'rol_admin_dba') THEN
+        DROP OWNED BY rol_admin_dba;
+        DROP ROLE rol_admin_dba;
+    END IF;
+END $$;
+
+
+-- ==========================================================================
+-- 1. CREACIÓN DE ROLES Y USUARIO BACKEND
+-- ==========================================================================
+
+-- A. DEFINICIÓN DE ROLES
+CREATE ROLE rol_admin_dba WITH LOGIN PASSWORD 'admin123' SUPERUSER;
+CREATE ROLE rol_usuario_comun WITH NOLOGIN;
+CREATE ROLE rol_institucional WITH NOLOGIN;
+CREATE ROLE rol_auditor WITH NOLOGIN;
+
+-- B. CONEXIÓN Y ESQUEMA
+GRANT CONNECT ON DATABASE soyucab_db TO rol_usuario_comun, rol_institucional, rol_auditor;
+GRANT USAGE ON SCHEMA public TO rol_usuario_comun, rol_institucional, rol_auditor;
+
+-- C. USUARIO TÉCNICO (APP BACKEND)
+CREATE USER app_backend WITH PASSWORD 'soyucab_pass';
+GRANT CONNECT ON DATABASE soyucab_db TO app_backend;
+GRANT USAGE ON SCHEMA public TO app_backend;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_backend;
+
+-- Asignación de roles (Switching)
+GRANT rol_usuario_comun TO app_backend;
+GRANT rol_institucional TO app_backend;
+GRANT rol_auditor TO app_backend;
+GRANT rol_admin_dba TO app_backend;
+
+
+-- ==========================================================================
+-- 2. PERMISOS (GRANTS)
+-- ==========================================================================
+
+-- --- ROL USUARIO COMÚN ---
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO rol_usuario_comun;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO rol_usuario_comun;
+
+-- Escritura: Registro y Perfil
+GRANT INSERT ON Ente, Persona, Nexo_Institucional, Forma_Parte_De TO rol_usuario_comun;
+GRANT UPDATE (nombre, apellido, ocupacion) ON Persona TO rol_usuario_comun;
+GRANT UPDATE (ubicacion_pais, ubicacion_estado, ubicacion_ciudad, direccion_detalle) ON Ente TO rol_usuario_comun;
+GRANT INSERT, UPDATE, DELETE ON Telefono, Es_Poseida TO rol_usuario_comun;
+-- Registro Institucional Público
+GRANT INSERT ON Dependencia_UCAB, Organizacion_Asociada TO rol_usuario_comun;
+
+-- Escritura: Social
+GRANT INSERT, DELETE ON Publicacion, Publica, Reaccion, Comentario TO rol_usuario_comun;
+GRANT INSERT, UPDATE, DELETE ON Relacion, Notificacion TO rol_usuario_comun;
+GRANT INSERT, DELETE ON Membresia_Grupo, Asistencia_Evento TO rol_usuario_comun;
+
+-- --- ROL INSTITUCIONAL ---
+GRANT SELECT ON Ente, Dependencia_UCAB, Organizacion_Asociada TO rol_institucional;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO rol_institucional;
+-- Gestión Eventos
+GRANT SELECT, INSERT, UPDATE, DELETE ON Evento TO rol_institucional;
+GRANT SELECT, INSERT ON Organizador_Evento TO rol_institucional;
+GRANT SELECT, INSERT ON Notificacion TO rol_institucional;
+
+-- --- ROL AUDITOR ---
+GRANT SELECT ON vw_estadisticas_anonimas TO rol_auditor;
+
+
+-- ==========================================================================
+-- 3. ACTIVAR RLS
+-- ==========================================================================
+ALTER TABLE Ente ENABLE ROW LEVEL SECURITY;
+ALTER TABLE Persona ENABLE ROW LEVEL SECURITY;
+ALTER TABLE Telefono ENABLE ROW LEVEL SECURITY;
+ALTER TABLE Publicacion ENABLE ROW LEVEL SECURITY;
+ALTER TABLE Notificacion ENABLE ROW LEVEL SECURITY;
+ALTER TABLE Relacion ENABLE ROW LEVEL SECURITY;
+ALTER TABLE Es_Poseida ENABLE ROW LEVEL SECURITY;
+ALTER TABLE Asistencia_Evento ENABLE ROW LEVEL SECURITY;
+ALTER TABLE Membresia_Grupo ENABLE ROW LEVEL SECURITY;
+-- Institucional
+ALTER TABLE Evento ENABLE ROW LEVEL SECURITY;
+ALTER TABLE Dependencia_UCAB ENABLE ROW LEVEL SECURITY;
+ALTER TABLE Organizacion_Asociada ENABLE ROW LEVEL SECURITY;
+
+
+-- ==========================================================================
+-- 4. POLÍTICAS DE SEGURIDAD (POLICIES)
+-- ==========================================================================
+
+-- --------------------------------------------------------------------------
+-- 4.1. USUARIO COMÚN
+-- --------------------------------------------------------------------------
+-- PERFIL
+CREATE POLICY policy_ver_personas_publico ON Persona FOR SELECT TO rol_usuario_comun USING (true);
+CREATE POLICY policy_ver_entes_publicos ON Ente FOR SELECT TO rol_usuario_comun USING (true);
+CREATE POLICY policy_registro_persona ON Persona FOR INSERT TO rol_usuario_comun WITH CHECK (true);
+CREATE POLICY policy_registro_ente ON Ente FOR INSERT TO rol_usuario_comun WITH CHECK (true);
+CREATE POLICY policy_editar_persona_propia ON Persona FOR UPDATE TO rol_usuario_comun USING (id_ente = current_setting('app.current_ente_id', true)::INT);
+CREATE POLICY policy_editar_ente_propio ON Ente FOR UPDATE TO rol_usuario_comun USING (id_ente = current_setting('app.current_ente_id', true)::INT);
+CREATE POLICY policy_telefono_propio ON Telefono FOR ALL TO rol_usuario_comun USING (id_ente_persona = current_setting('app.current_ente_id', true)::INT);
+CREATE POLICY policy_mis_habilidades ON Es_Poseida FOR ALL TO rol_usuario_comun USING (id_ente_persona = current_setting('app.current_ente_id', true)::INT);
+
+-- PUBLICACIONES
+CREATE POLICY policy_ver_publicaciones ON Publicacion FOR SELECT TO rol_usuario_comun
+    USING (
+        visibilidad = 'publica'
+        OR id_publicacion IN (
+            SELECT P.id_publicacion FROM Publica P
+            WHERE P.id_ente = current_setting('app.current_ente_id', true)::INT
+            OR P.id_ente IN (
+                SELECT CASE WHEN id_ente1 = current_setting('app.current_ente_id', true)::INT THEN id_ente2 ELSE id_ente1 END
+                FROM Relacion
+                WHERE (id_ente1 = current_setting('app.current_ente_id', true)::INT OR id_ente2 = current_setting('app.current_ente_id', true)::INT)
+                AND tipo = 'amistad' AND estado = 'aceptada'
+            )
+        )
+        OR id_publicacion NOT IN (SELECT id_publicacion FROM Publica)
+    );
+CREATE POLICY policy_crear_publicacion ON Publicacion FOR INSERT TO rol_usuario_comun WITH CHECK (true);
+CREATE POLICY policy_borrar_publicacion ON Publicacion FOR DELETE TO rol_usuario_comun USING (id_publicacion IN (SELECT id_publicacion FROM Publica WHERE id_ente = current_setting('app.current_ente_id', true)::INT));
+
+-- SOCIAL Y OTROS
+CREATE POLICY policy_ver_relaciones ON Relacion FOR SELECT TO rol_usuario_comun USING (true);
+CREATE POLICY policy_crear_relacion ON Relacion FOR INSERT TO rol_usuario_comun WITH CHECK (id_ente1 = current_setting('app.current_ente_id', true)::INT);
+CREATE POLICY policy_aceptar_relacion ON Relacion FOR UPDATE TO rol_usuario_comun USING (id_ente2 = current_setting('app.current_ente_id', true)::INT);
+CREATE POLICY policy_borrar_relacion ON Relacion FOR DELETE TO rol_usuario_comun USING (id_ente1 = current_setting('app.current_ente_id', true)::INT OR id_ente2 = current_setting('app.current_ente_id', true)::INT);
+
+CREATE POLICY policy_gestionar_asistencia ON Asistencia_Evento FOR ALL TO rol_usuario_comun USING (id_ente_persona = current_setting('app.current_ente_id', true)::INT) WITH CHECK (id_ente_persona = current_setting('app.current_ente_id', true)::INT);
+
+CREATE POLICY policy_ver_mis_notificaciones ON Notificacion FOR SELECT TO rol_usuario_comun USING (id_ente = current_setting('app.current_ente_id', true)::INT);
+CREATE POLICY policy_crear_notificacion ON Notificacion FOR INSERT TO rol_usuario_comun WITH CHECK (true);
+CREATE POLICY policy_actualizar_notificacion_propia ON Notificacion FOR UPDATE TO rol_usuario_comun USING (id_ente = current_setting('app.current_ente_id', true)::INT);
+
+CREATE POLICY policy_gestionar_membresia ON Membresia_Grupo FOR ALL TO rol_usuario_comun USING (id_ente = current_setting('app.current_ente_id', true)::INT) WITH CHECK (id_ente = current_setting('app.current_ente_id', true)::INT);
+
+CREATE POLICY policy_ver_eventos_publicos ON Evento FOR SELECT TO rol_usuario_comun USING (estado IN ('publicado', 'finalizado', 'en-curso'));
+
+
+-- --------------------------------------------------------------------------
+-- 4.2. ROL INSTITUCIONAL
+-- --------------------------------------------------------------------------
+CREATE POLICY policy_ver_mi_dependencia ON Dependencia_UCAB FOR SELECT TO rol_institucional USING (id_ente = current_setting('app.current_ente_id', true)::INT);
+CREATE POLICY policy_ver_mi_organizacion ON Organizacion_Asociada FOR SELECT TO rol_institucional USING (id_ente = current_setting('app.current_ente_id', true)::INT);
+CREATE POLICY policy_ver_ente_inst ON Ente FOR SELECT TO rol_institucional USING (id_ente = current_setting('app.current_ente_id', true)::INT);
+
+-- Gestión Eventos
+CREATE POLICY policy_institucional_insert ON Evento FOR INSERT TO rol_institucional WITH CHECK (true);
+CREATE POLICY policy_institucional_select ON Evento FOR SELECT TO rol_institucional
+    USING (
+        id_evento IN (SELECT id_evento FROM Organizador_Evento WHERE id_ente = current_setting('app.current_ente_id', true)::INT)
+        OR id_evento NOT IN (SELECT id_evento FROM Organizador_Evento)
+    );
+CREATE POLICY policy_institucional_modificar ON Evento FOR UPDATE TO rol_institucional USING (id_evento IN (SELECT id_evento FROM Organizador_Evento WHERE id_ente = current_setting('app.current_ente_id', true)::INT));
+CREATE POLICY policy_institucional_borrar ON Evento FOR DELETE TO rol_institucional USING (id_evento IN (SELECT id_evento FROM Organizador_Evento WHERE id_ente = current_setting('app.current_ente_id', true)::INT));
+
+
+-- ==========================================================================
+-- 5. FUNCIONES Y AJUSTES FINALES
+-- ==========================================================================
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'evento_id_evento_seq') THEN
+        CREATE SEQUENCE evento_id_evento_seq OWNED BY Evento.id_evento;
+        ALTER TABLE Evento ALTER COLUMN id_evento SET DEFAULT nextval('evento_id_evento_seq');
+    END IF;
+    PERFORM setval('evento_id_evento_seq', COALESCE(MAX(id_evento), 0) + 1) FROM Evento;
+END $$;
+GRANT USAGE, SELECT ON SEQUENCE evento_id_evento_seq TO rol_institucional;
+
+-- Trigger Asistencia (Security Definer)
+CREATE OR REPLACE FUNCTION fn_trigger_conteo_inscritos()
+RETURNS TRIGGER SECURITY DEFINER AS $$
+BEGIN
+    IF (TG_OP = 'INSERT') THEN
+        UPDATE Evento SET cantidad_asistentes = COALESCE(cantidad_asistentes, 0) + 1 WHERE id_evento = NEW.id_evento;
+        RETURN NEW;
+    ELSIF (TG_OP = 'DELETE') THEN
+        UPDATE Evento SET cantidad_asistentes = GREATEST(cantidad_asistentes - 1, 0) WHERE id_evento = OLD.id_evento;
+        RETURN OLD;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Vista Auditoría
+CREATE OR REPLACE VIEW vw_estadisticas_anonimas AS
+SELECT
+    (SELECT COUNT(*) FROM Persona) as total_usuarios,
+    (SELECT COUNT(*) FROM Grupo) as total_grupos,
+    (SELECT COUNT(*) FROM Evento WHERE estado = 'finalizado') as eventos_realizados,
+    (SELECT COUNT(*) FROM Organizacion_Asociada) as empresas_aliadas;
+GRANT SELECT ON vw_estadisticas_anonimas TO rol_auditor;
+
+-- FIN DEL SCRIPT
+--- FIN DE ARCHIVO: BD\SEGURIDAD\ROLES.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: BD\TRIGGERS\TRIGGERS.sql ---
+----------------------------------------
+-- [JAVIER] Validar Representante Único
+CREATE OR REPLACE FUNCTION fn_trigger_validar_representante()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.rol IN ('Lider', 'Representante') THEN
+        IF EXISTS (SELECT 1 FROM Membresia_Grupo WHERE id_grupo = NEW.id_grupo AND rol = NEW.rol AND id_ente <> NEW.id_ente) THEN
+            RAISE EXCEPTION 'Error: El grupo ya tiene un % activo.', NEW.rol;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER tg_validar_representante_unico
+BEFORE INSERT OR UPDATE ON Membresia_Grupo
+FOR EACH ROW EXECUTE FUNCTION fn_trigger_validar_representante();
+
+-- [KEVIN] Trigger Conteo Asistentes
+CREATE OR REPLACE FUNCTION fn_trigger_conteo_inscritos()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (TG_OP = 'INSERT') THEN
+        UPDATE Evento SET cantidad_asistentes = COALESCE(cantidad_asistentes, 0) + 1 WHERE id_evento = NEW.id_evento;
+        RETURN NEW;
+    ELSIF (TG_OP = 'DELETE') THEN
+        UPDATE Evento SET cantidad_asistentes = cantidad_asistentes - 1 WHERE id_evento = OLD.id_evento;
+        RETURN OLD;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER tg_mantener_conteo_inscritos
+AFTER INSERT OR DELETE ON Asistencia_Evento
+FOR EACH ROW EXECUTE FUNCTION fn_trigger_conteo_inscritos();
+
+-----------------------------PRUEBA DE TRIGGER-----------------------------------
+
+-- PASO 1: Veamos cuántos asistentes tiene el evento 600 (Feria de Empleo) AHORA
+-- (Debería tener 2 asistentes según nuestro script de carga)
+SELECT id_evento, nombre, cantidad_asistentes
+FROM Evento
+WHERE id_evento = 600;
+
+-- PASO 2: ¡DISPARAMOS EL TRIGGER! 🔫
+-- Vamos a inscribir a una persona nueva (ej: Kevin, id=2) en ese evento.
+-- Al hacer este INSERT, el trigger saltará automáticamente "por detrás".
+INSERT INTO Asistencia_Evento (id_evento, id_ente_persona, estadoRegistro, fechaRegistro)
+VALUES (600, 2, 'registrado', NOW());
+
+-- PASO 3: Verificamos el resultado
+-- Volvemos a consultar el evento.
+-- ¡El número 'cantidad_asistentes' debería haber subido a 3 AUTOMÁTICAMENTE!
+SELECT id_evento, nombre, cantidad_asistentes
+FROM Evento
+WHERE id_evento = 602;
+
+-- PASO 4: Prueba de borrado (El trigger también resta)
+-- Ahora Kevin se arrepiente y borramos su inscripción.
+DELETE FROM Asistencia_Evento
+WHERE id_evento = 600 AND id_ente_persona = 2;
+
+-- Verificamos que el número bajó otra vez a 2
+SELECT id_evento, nombre, cantidad_asistentes
+FROM Evento
+WHERE id_evento = 600;
+--- FIN DE ARCHIVO: BD\TRIGGERS\TRIGGERS.sql ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\base.html ---
+----------------------------------------
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}SoyUCAB{% endblock %}</title>
+    
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    
+    <style>
+        body { background-color: #f0f2f5; }
+        .navbar { background-color: #004481 !important; } /* Azul Institucional UCAB */
+        .notif-badge { font-size: 0.65rem; top: 5px !important; }
+        .nav-link { font-weight: 500; }
+    </style>
+</head>
+<body class="d-flex flex-column min-vh-100">
+
+    {% if session['user_id'] %}
+    <nav class="navbar navbar-expand-lg navbar-dark sticky-top shadow-sm mb-4">
+        <div class="container">
+            <a class="navbar-brand fw-bold" href="/home">SoyUCAB</a>
+            
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto align-items-center">
+                    
+                    {% if session.get('db_role') == 'rol_institucional' %}
+                        <li class="nav-item">
+                            <a href="/institucional" class="nav-link fw-bold text-white">
+                                <i class="bi bi-speedometer2 me-1"></i> Panel de Gestión
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a href="/eventos" class="nav-link text-white-50">
+                                <i class="bi bi-calendar-event me-1"></i> Ver Calendario Público
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a href="/logout" class="btn btn-outline-light btn-sm ms-lg-3 fw-bold">Cerrar Sesión</a>
+                        </li>
+
+                    {% elif session.get('db_role') == 'rol_auditor' %}
+                        <li class="nav-item">
+                            <span class="nav-link text-warning fw-bold">
+                                <i class="bi bi-eye-fill me-1"></i> Modo Auditoría
+                            </span>
+                        </li>
+                        <li class="nav-item">
+                            <a href="/logout" class="btn btn-outline-light btn-sm ms-lg-3 fw-bold">Cerrar Sesión</a>
+                        </li>
+                    
+                    {% elif session.get('db_role') == 'rol_admin_dba' %}
+                        <li class="nav-item">
+                            <span class="nav-link text-danger fw-bold">
+                                <i class="bi bi-shield-lock-fill me-1"></i> SUPERUSUARIO
+                            </span>
+                        </li>
+                        <li class="nav-item">
+                            <a href="/logout" class="btn btn-outline-light btn-sm ms-lg-3 fw-bold">Cerrar Sesión</a>
+                        </li>
+
+                    {% else %}
+                        <li class="nav-item"><a href="/home" class="nav-link">Inicio</a></li>
+                        <li class="nav-item"><a href="/usuarios" class="nav-link">🔍 Miembros</a></li>
+                        <li class="nav-item"><a href="/grupos" class="nav-link">Grupos</a></li>
+                        <li class="nav-item"><a href="/eventos" class="nav-link">Eventos</a></li>
+                        <li class="nav-item"><a href="/dashboard" class="nav-link">📊 Reportes</a></li>
+                        
+                        <li class="nav-item">
+                            <a href="/notificaciones" class="nav-link position-relative px-3" title="Notificaciones">
+                                <i class="bi bi-bell-fill fs-5"></i>
+                                {% if notif_count and notif_count > 0 %}
+                                    <span class="position-absolute start-100 translate-middle badge rounded-pill bg-danger notif-badge">
+                                        {{ notif_count }}
+                                    </span>
+                                {% endif %}
+                            </a>
+                        </li>
+                        
+                        <li class="nav-item"><a href="/perfil" class="nav-link">Mi Perfil</a></li>
+                        <li class="nav-item">
+                            <a href="/logout" class="btn btn-outline-light btn-sm ms-lg-3 fw-bold">Cerrar Sesión</a>
+                        </li>
+                    {% endif %}
+
+                </ul>
+            </div>
+        </div>
+    </nav>
+    {% endif %}
+
+    <main class="flex-grow-1">
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="py-4 mt-5 bg-white border-top text-center text-muted small">
+        <div class="container">
+            <p class="mb-0">© 2026 SoyUCAB - Universidad Católica Andrés Bello</p>
+            <p class="mb-0">Sistema de Gestión de Egresados y Comunidad</p>
+        </div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+--- FIN DE ARCHIVO: templates\base.html ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\dashboard.html ---
+----------------------------------------
+{% extends "base.html" %}
+{% block title %}Dashboard - SoyUCAB{% endblock %}
+{% block content %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+
+<div class="container mt-4 mb-5">
+    
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="fw-bold">📊 Dashboard de Gestión</h2>
+        <button onclick="generatePDF()" class="btn btn-danger border-2">
+            <i class="bi bi-file-earmark-pdf-fill me-2"></i>Descargar PDF
+        </button>
+    </div>
+
+    <ul class="nav nav-pills nav-fill mb-4 p-2 bg-white rounded shadow-sm" id="reportTabs" role="tablist">
+        <li class="nav-item"><button class="nav-link active fw-bold" data-bs-toggle="pill" data-bs-target="#tab1">Popularidad</button></li>
+        <li class="nav-item"><button class="nav-link fw-bold" data-bs-toggle="pill" data-bs-target="#tab2">Actividad</button></li>
+        <li class="nav-item"><button class="nav-link fw-bold" data-bs-toggle="pill" data-bs-target="#tab3">Docencia</button></li>
+        <li class="nav-item"><button class="nav-link fw-bold" data-bs-toggle="pill" data-bs-target="#tab4">Antigüedad</button></li>
+        <li class="nav-item"><button class="nav-link fw-bold" data-bs-toggle="pill" data-bs-target="#tab5">Tutorías</button></li>
+        <li class="nav-item"><button class="nav-link fw-bold" data-bs-toggle="pill" data-bs-target="#tab6">Calendario</button></li>
+    </ul>
+
+    <div class="tab-content" id="report-container">
+        
+        <div class="tab-pane fade show active" id="tab1">
+            <div class="card shadow-sm border-0">
+                <div class="card-header bg-primary text-white d-flex justify-content-between">
+                    <h5 class="mb-0 fw-bold">Ranking de Popularidad de Grupos</h5>
+                </div>
+                <div class="card-body">
+                    <table class="table align-middle">
+                        <thead class="table-light"><tr><th>Grupo</th><th>Miembros</th><th>Popularidad Global</th></tr></thead>
+                        <tbody>
+                            {% for r in rep1 %}
+                            <tr>
+                                <td class="fw-bold">{{ r[0] }}</td>
+                                <td>{{ r[1] }}</td>
+                                <td>
+                                    <div class="d-flex align-items-center">
+                                        <div class="progress flex-grow-1 me-2" style="height: 10px;">
+                                            <div class="progress-bar" style="width: {{ r[2] }}%"></div>
+                                        </div>
+                                        <span class="small fw-bold">{{ r[2] }}%</span>
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-pane fade" id="tab2">
+            <div class="card shadow-sm border-0">
+                <div class="card-header bg-success text-white">
+                    <h5 class="mb-0 fw-bold">Grupos Más Activos</h5>
+                </div>
+                <div class="card-body">
+                    <table class="table table-hover">
+                        <thead class="table-light"><tr><th>Grupo</th><th>Eventos</th><th>Estatus</th></tr></thead>
+                        <tbody>
+                            {% for r in rep2 %}
+                            <tr>
+                                <td>{{ r[0] }}</td>
+                                <td class="fw-bold">{{ r[1] }}</td>
+                                <td>
+                                    {% if r[2] == 'Muy Activo' %}<span class="badge bg-success">Muy Activo</span>
+                                    {% elif r[2] == 'Regular' %}<span class="badge bg-warning text-dark">Regular</span>
+                                    {% else %}<span class="badge bg-secondary">Inactivo</span>{% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-pane fade" id="tab3">
+            <div class="card shadow-sm border-0">
+                <div class="card-header bg-info text-white">
+                    <h5 class="mb-0 fw-bold">Carga Académica en Eventos</h5>
+                </div>
+                <div class="card-body">
+                    <table class="table">
+                        <thead class="table-light"><tr><th>Docente</th><th class="text-center">Eventos</th><th class="text-end">Horas Dictadas</th></tr></thead>
+                        <tbody>
+                            {% for r in rep3 %}
+                            <tr>
+                                <td>{{ r[0] }}</td>
+                                <td class="text-center">{{ r[1] }}</td>
+                                <td class="text-end fw-bold text-info">{{ r[2]|round(1) }} hrs</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-pane fade" id="tab4">
+            <div class="card shadow-sm border-0">
+                <div class="card-header bg-warning text-dark">
+                    <h5 class="mb-0 fw-bold">Personal con Mayor Trayectoria</h5>
+                </div>
+                <div class="card-body">
+                    <table class="table table-striped">
+                        <thead><tr><th>Nombre</th><th>Cargo</th><th>Ingreso</th><th>Antigüedad</th></tr></thead>
+                        <tbody>
+                            {% for r in rep4 %}
+                            <tr>
+                                <td class="fw-bold">{{ r[0] }}</td>
+                                <td>{{ r[1] }}</td>
+                                <td>{{ r[2].strftime('%d/%m/%Y') }}</td>
+                                <td class="fw-bold text-primary">{{ r[3]|int }} Años</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-pane fade" id="tab5">
+            <div class="card shadow-sm border-0">
+                <div class="card-header bg-dark text-white">
+                    <h5 class="mb-0 fw-bold">Egresados Tutores de Excelencia</h5>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        {% for r in rep5 %}
+                        <div class="col-md-4 mb-3">
+                            <div class="border rounded p-3 text-center bg-light">
+                                <h6 class="fw-bold text-dark">{{ r[0] }}</h6>
+                                <div class="text-muted small mb-2">Tutor desde {{ r[2].strftime('%Y') }}</div>
+                                <span class="badge bg-warning text-dark border border-dark">Promedio: {{ r[1] }}</span>
+                            </div>
+                        </div>
+                        {% else %}
+                        <div class="col-12 text-center text-muted">No hay datos suficientes.</div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-pane fade" id="tab6">
+            <div class="card shadow-sm border-0">
+                <div class="card-header bg-secondary text-white">
+                    <h5 class="mb-0 fw-bold">Estado de Eventos Públicos</h5>
+                </div>
+                <div class="card-body p-0">
+                    <table class="table table-striped mb-0">
+                        <thead class="table-dark"><tr><th>Evento</th><th>Lugar</th><th>Fecha</th><th>Estado</th></tr></thead>
+                        <tbody>
+                            {% for r in rep6 %}
+                            <tr>
+                                <td class="ps-4 fw-bold">{{ r[0] }}</td>
+                                <td>{{ r[1] }}</td>
+                                <td>{{ r[2].strftime('%d/%m/%Y %H:%M') }}</td>
+                                <td>
+                                    {% if r[3] == 'publicado' %}<span class="badge bg-success">Publicado</span>
+                                    {% elif r[3] == 'finalizado' %}<span class="badge bg-secondary">Finalizado</span>
+                                    {% else %}<span class="badge bg-warning text-dark">{{ r[3] }}</span>{% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<script>
+function generatePDF() {
+    // 1. Identificar la pestaña activa para imprimir SOLO eso
+    const activeTab = document.querySelector('.tab-pane.active');
+    
+    if (!activeTab) {
+        alert("Por favor selecciona un reporte.");
+        return;
+    }
+
+    // 2. Configuración de la "Herramienta de Reportes"
+    const opt = {
+        margin:       1,
+        filename:     'Reporte_Gestion_SoyUCAB.pdf',
+        image:        { type: 'jpeg', quality: 0.98 },
+        html2canvas:  { scale: 2 },
+        jsPDF:        { unit: 'in', format: 'letter', orientation: 'portrait' }
+    };
+
+    // 3. Agregar encabezado temporal para el PDF
+    const content = document.createElement('div');
+    content.innerHTML = `
+        <div style="padding: 20px; text-align: center;">
+            <h2 style="color: #004481;">SoyUCAB - Reporte Oficial</h2>
+            <p style="color: #666;">Generado el: ${new Date().toLocaleDateString()}</p>
+            <hr>
+        </div>
+    ` + activeTab.innerHTML;
+
+    // 4. Generar y Descargar
+    html2pdf().set(opt).from(content).save();
+}
+</script>
+{% endblock %}
+--- FIN DE ARCHIVO: templates\dashboard.html ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\eventos.html ---
+----------------------------------------
+{% extends "base.html" %}
+{% block title %}Eventos - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <h2 class="fw-bold mb-4">Calendario de Eventos</h2>
+    {% with messages = get_flashed_messages() %}
+        {% if messages %}<div class="alert alert-info">{{ messages[0] }}</div>{% endif %}
+    {% endwith %}
+
+    <div class="list-group shadow-sm border-0">
+        {% for e in eventos %}
+        <div class="list-group-item p-4 border-0 mb-2 rounded shadow-sm {% if e[9] == 'finalizado' %}bg-light text-muted{% else %}bg-white{% endif %}">
+            <div class="row align-items-center">
+                <div class="col-md-2 text-center border-end">
+                    <h3 class="fw-bold {% if e[9] == 'finalizado' %}text-secondary{% else %}text-primary{% endif %} mb-0">{{ e[3].strftime('%d') }}</h3>
+                    <small class="text-uppercase d-block">{{ e[3].strftime('%b %Y') }}</small>
+                    <small>{{ e[3].strftime('%H:%M') }}</small>
+                </div>
+                
+                <div class="col-md-7 ps-4">
+                    {% if e[9] == 'finalizado' %}
+                        <span class="badge bg-secondary mb-2">FINALIZADO</span>
+                    {% elif e[9] == 'borrador' %}
+                        <span class="badge bg-warning text-dark mb-2">BORRADOR</span>
+                    {% endif %}
+                
+                    {% if e[7] %}
+                        <small class="fw-bold d-block text-primary"><i class="bi bi-people-fill"></i> Grupo: {{ e[7] }}</small>
+                    {% endif %}
+                    
+                    <h5 class="fw-bold mb-1 mt-1">{{ e[1] }}</h5>
+                    <span class="badge bg-light text-dark border me-2">{{ e[2]|format_tipo }}</span>
+                    <small><i class="bi bi-geo-alt"></i> {{ e[4] }} • {{ e[5] }} asistentes</small>
+                </div>
+                
+                <div class="col-md-3 text-end">
+                    
+                    {% if e[9] == 'publicado' and session.get('db_role') != 'rol_institucional' and session.get('db_role') != 'rol_auditor' %}
+                        {% if e[6] %}
+                            <div class="btn-group">
+                                <button class="btn btn-success btn-sm disabled"><i class="bi bi-check"></i> Listo</button>
+                                <a href="/unjoin_event/{{ e[0] }}" class="btn btn-outline-danger btn-sm" title="Cancelar asistencia"><i class="bi bi-x"></i></a>
+                            </div>
+                        {% else %}
+                            <a href="/asistir/{{ e[0] }}" class="btn btn-primary btn-sm px-4 rounded-pill">Asistir</a>
+                        {% endif %}
+                    {% endif %}
+                    
+                    {% if e[7] and e[9] == 'publicado' and e[10] %}
+                        <div class="mt-2">
+                            <a href="/notify_group/{{ e[0] }}/{{ e[8] }}" class="btn btn-warning btn-sm text-dark fw-bold text-decoration-none">
+                                <i class="bi bi-megaphone-fill"></i> Notificar al Grupo
+                            </a>
+                        </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+        {% else %}
+        <div class="alert alert-warning">No hay eventos visibles.</div>
+        {% endfor %}
+    </div>
+</div>
+{% endblock %}
+--- FIN DE ARCHIVO: templates\eventos.html ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\grupos.html ---
+----------------------------------------
+{% extends "base.html" %}
+{% block title %}Grupos - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="fw-bold mb-0">Comunidades</h2>
+        <form class="d-flex" method="GET" action="/grupos">
+            <input class="form-control me-2" type="search" name="q" placeholder="Buscar grupos..." value="{{ q }}">
+            <button class="btn btn-outline-primary" type="submit">Buscar</button>
+        </form>
+    </div>
+    
+    <div class="row">
+        {% for g in grupos %}
+        <div class="col-md-4 mb-4">
+            <div class="card shadow-sm border-0 h-100">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between">
+                        <span class="badge bg-info-subtle text-info mb-2">{{ g[2]|format_tipo }}</span>
+                        <span class="text-muted small"><i class="bi bi-people"></i> {{ g[4] }}</span>
+                    </div>
+                    <h5 class="card-title fw-bold">{{ g[1] }}</h5>
+                    
+                    {% if g[3] %}
+                        <div class="d-grid gap-2">
+                            <button class="btn btn-sm btn-success disabled">Eres Miembro</button>
+                            <a href="/leave_group/{{ g[0] }}" class="btn btn-sm btn-outline-danger">Salir</a>
+                        </div>
+                    {% else %}
+                        <a href="/join_group/{{ g[0] }}" class="btn btn-sm btn-outline-primary w-100">Unirse</a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+        {% else %}
+        <div class="col-12"><div class="alert alert-warning">No se encontraron grupos.</div></div>
+        {% endfor %}
+    </div>
+</div>
+{% endblock %}
+--- FIN DE ARCHIVO: templates\grupos.html ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\home.html ---
+----------------------------------------
+{% extends "base.html" %}
+{% block content %}
+<div class="container">
+    <div class="row">
+        <div class="col-md-3 d-none d-md-block">
+            <div class="card shadow-sm border-0 p-4 text-center">
+                <div class="bg-secondary rounded-circle mx-auto mb-3 d-flex justify-content-center align-items-center text-white fw-bold" style="width: 80px; height: 80px; font-size: 2rem;">{{ user_name[0] }}</div>
+                <h5 class="fw-bold mb-0 text-dark">{{ user_name }}</h5>
+                <p class="text-muted small mb-3">{{ session['user_email'] }}</p>
+                <div class="d-grid gap-2">
+                    <a href="/perfil" class="btn btn-primary btn-sm">Mi Perfil</a>
+                    <a href="/perfil" class="btn btn-outline-secondary btn-sm">Configuración</a>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-6">
+            <div class="card shadow-sm mb-4 border-0">
+                <div class="card-body">
+                    <form action="/create_post" method="POST">
+                        <textarea name="contenido" class="form-control border-0 bg-light mb-2" rows="2" placeholder="Comparte algo con la comunidad..." required></textarea>
+                        <div class="d-flex justify-content-between">
+                            <div class="d-flex gap-1">
+                                <select name="tipo" class="form-select form-select-sm w-auto border-0 bg-light">
+                                    <option value="mensaje">💬 Mensaje</option>
+                                    <option value="oferta">💰 Oferta</option>
+                                    <option value="anuncio">📢 Anuncio</option>
+                                </select>
+                                <select name="visibilidad" class="form-select form-select-sm w-auto border-0 bg-light text-primary fw-bold"><option value="publica">🌐 Público</option><option value="solo-amigos">👥 Amigos</option><option value="privada">🔒 Solo yo</option></select>
+                            </div>
+                            <button type="submit" class="btn btn-primary btn-sm rounded-pill px-4">Publicar</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            {% for post in posts %}
+            <div class="card shadow-sm mb-3 border-0">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-start">
+                        <div class="d-flex align-items-center mb-3">
+                            <div class="bg-primary rounded-circle text-white d-flex justify-content-center align-items-center me-2 fw-bold" style="width: 40px; height: 40px;">{{ post.autor[0] }}</div>
+                            <div>
+                                <h6 class="mb-0 fw-bold">{{ post.autor }}</h6>
+                                <small class="text-muted">{{ post.tipo|format_tipo }} • {{ post.fecha.strftime('%d/%m/%Y') }}</small>
+                            </div>
+                        </div>
+                        {% if post.es_mio %}
+                            <a href="/delete_post/{{ post.id }}" class="text-danger" title="Eliminar" onclick="return confirm('¿Borrar post?')"><i class="bi bi-trash"></i></a>
+                        {% endif %}
+                    </div>
+                    
+                    <p class="mb-3 text-dark">{{ post.contenido }}</p>
+                    <hr class="my-2 opacity-25">
+                    
+                    <div class="d-flex gap-4 mb-3">
+                        <a href="/like/{{ post.id }}" class="btn btn-link btn-sm text-decoration-none p-0">
+                            {% if post.liked %}<i class="bi bi-heart-fill text-danger"></i>{% else %}<i class="bi bi-heart text-muted"></i>{% endif %}
+                            <strong class="text-dark">{{ post.likes }}</strong>
+                        </a>
+                        <button class="btn btn-link btn-sm text-decoration-none text-muted p-0" type="button" data-bs-toggle="collapse" data-bs-target="#comments-{{ post.id }}">
+                            <i class="bi bi-chat-left-dots"></i> Comentarios ({{ post.comentarios|length }})
+                        </button>
+                    </div>
+
+                    <div class="collapse bg-light p-3 rounded" id="comments-{{ post.id }}">
+                        {% for c in post.comentarios %}
+                            <div class="mb-2 border-bottom pb-1">
+                                <strong class="small text-dark">{{ c[0] }} {{ c[1] }}</strong>
+                                <span class="text-muted x-small ms-2">{{ c[3].strftime('%d/%m %H:%M') }}</span>
+                                <p class="mb-0 small">{{ c[2] }}</p>
+                            </div>
+                        {% endfor %}
+                        <form action="/add_comment" method="POST" class="mt-2 d-flex">
+                            <input type="hidden" name="id_pub" value="{{ post.id }}">
+                            <input type="text" name="contenido" class="form-control form-control-sm me-2" placeholder="Escribe un comentario..." required>
+                            <button type="submit" class="btn btn-primary btn-sm"><i class="bi bi-send"></i></button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            {% else %}
+                <div class="text-center py-5 text-muted"><p>No hay publicaciones.</p></div>
+            {% endfor %}
+        </div>
+
+        <div class="col-md-3 d-none d-lg-block">
+            <div class="card shadow-sm border-0">
+                <div class="card-header bg-white fw-bold">Mis Conexiones</div>
+                <div class="list-group list-group-flush">
+                    {% for c in mis_conexiones %}
+                    <a href="/perfil/{{ c[0] }}" class="list-group-item list-group-item-action d-flex align-items-center">
+                        <div class="bg-primary-subtle rounded-circle me-2 d-flex justify-content-center align-items-center text-primary fw-bold" style="width: 32px; height: 32px;">{{ c[1][0] }}</div>
+                        <div class="flex-grow-1 overflow-hidden">
+                            <div class="text-truncate fw-bold small">{{ c[1] }} {{ c[2] }}</div>
+                            <div class="text-muted x-small">{{ c[3]|title }}</div>
+                        </div>
+                    </a>
+                    {% else %}
+                    <div class="p-3 text-center text-muted small">No tienes conexiones activas.</div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+--- FIN DE ARCHIVO: templates\home.html ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\home_institucional.html ---
+----------------------------------------
+{% extends "base.html" %}
+{% block title %}Panel Institucional - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <div class="card shadow-sm border-0 mb-4 bg-dark text-white">
+        <div class="card-body p-4 d-flex justify-content-between align-items-center">
+            <div>
+                <h6 class="text-uppercase text-info mb-1">{{ datos[1] }}</h6>
+                <h2 class="fw-bold mb-0">{{ datos[0] }}</h2>
+                <small class="opacity-75"><i class="bi bi-geo-alt"></i> {{ datos[2] }}</small>
+            </div>
+            <div class="text-end">
+                <button class="btn btn-info fw-bold text-dark" data-bs-toggle="modal" data-bs-target="#modalEvento">
+                    <i class="bi bi-plus-circle me-2"></i>Nuevo Evento
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div class="card shadow-sm border-0">
+        <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center">
+            <h5 class="fw-bold mb-0 text-primary">📅 Historial de Publicaciones</h5>
+            <small class="text-muted">Estos son los eventos creados por tu dependencia</small>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th style="width: 40%;">Evento</th>
+                        <th>Fecha</th>
+                        <th>Lugar</th>
+                        <th class="text-center">Inscritos</th>
+                        <th class="text-center">Estado</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for e in eventos %}
+                    <tr>
+                        <td>
+                            <div class="fw-bold">{{ e[1] }}</div>
+                            <small class="text-muted">{{ e[2].strftime('%d/%m/%Y') }}</small>
+                        </td>
+                        <td>{{ e[2].strftime('%H:%M') }}</td>
+                        <td>{{ e[3] }}</td>
+                        <td class="text-center">
+                            <span class="badge bg-light text-dark border">{{ e[5] }}</span>
+                        </td>
+                        <td class="text-center">
+                            {% if e[4] == 'publicado' %}
+                                <span class="badge bg-success"><i class="bi bi-check-circle"></i> Público</span>
+                            {% elif e[4] == 'finalizado' %}
+                                <span class="badge bg-secondary">Finalizado</span>
+                            {% else %}
+                                <span class="badge bg-warning text-dark"><i class="bi bi-cone-striped"></i> {{ e[4]|title }}</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="5" class="text-center py-5 text-muted bg-light">
+                            <i class="bi bi-calendar-x display-4 d-block mb-3 opacity-50"></i>
+                            No has publicado eventos todavía.
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="modalEvento" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header bg-info">
+                <h5 class="modal-title fw-bold text-dark">Publicar Evento Oficial</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form action="/crear_evento_oficial" method="POST">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="fw-bold">Nombre del Evento</label>
+                        <input type="text" name="nombre" class="form-control" required>
+                    </div>
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <label class="fw-bold">Tipo</label>
+                            <select name="tipo" class="form-select">
+                                <option value="conferencia">Conferencia</option>
+                                <option value="taller">Taller</option>
+                                <option value="webinar">Webinar</option>
+                                <option value="acto-grado">Acto de Grado</option>
+                            </select>
+                        </div>
+                        <div class="col-6">
+                            <label class="fw-bold">Fecha y Hora</label>
+                            <input type="datetime-local" name="fecha" class="form-control" required>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="fw-bold">Lugar / Enlace</label>
+                        <input type="text" name="lugar" class="form-control" placeholder="Ej: Auditorio Hermano Lanz" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="fw-bold">Descripción</label>
+                        <textarea name="desc" class="form-control" rows="3"></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-info fw-bold text-dark">Publicar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}
+--- FIN DE ARCHIVO: templates\home_institucional.html ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\landing.html ---
+----------------------------------------
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Bienvenido a SoyUCAB</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .hero-section {
+            background: linear-gradient(rgba(0,68,129,0.8), rgba(0,68,129,0.8)), url('https://elucabista.com/wp-content/uploads/2018/05/Jardines-UCAB-Montalb%C3%A1n-3.jpg');
+            background-size: cover;
+            color: white;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+        }
+    </style>
+</head>
+<body>
+
+<nav class="navbar navbar-light bg-light px-4">
+    <a class="navbar-brand fw-bold text-primary" href="#">SOYUCAB</a>
+    <div>
+        <a href="#" class="btn btn-outline-primary me-2">Sobre nosotros</a>
+        <a href="/login" class="btn btn-primary">INICIAR SESIÓN</a>
+    </div>
+</nav>
+
+<section class="hero-section">
+    <div class="container text-center">
+        <h1 class="display-3 fw-bold mb-4">SOYUCAB</h1>
+        <p class="lead mb-5">Adéntrate a un mundo lleno de oportunidades y aprendizaje.</p>
+        
+        <div class="row justify-content-center gap-4">
+            <div class="col-md-5 card p-4 text-dark shadow">
+                <h4>¿Eres Estudiante, Profesor u Obrero?</h4>
+                <p>Conecta con tu comunidad ucabista.</p>
+                <a href="/register" class="btn btn-warning btn-lg fw-bold">REGISTRARME AQUÍ</a>
+            </div>
+
+            <div class="col-md-5 card p-4 text-dark shadow">
+                <h4>¿Eres Personal Administrativo?</h4>
+                <p>Gestiona tu Escuela o Dependencia.</p>
+                <a href="/register_entity" class="btn btn-info btn-lg fw-bold text-white">REGISTRARME AQUÍ</a>
+            </div>
+        </div>
+    </div>
+</section>
+
+</body>
+</html>
+--- FIN DE ARCHIVO: templates\landing.html ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\login.html ---
+----------------------------------------
+{% extends "base.html" %}
+
+{% block title %}Login - SoyUCAB{% endblock %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="row justify-content-center">
+        <div class="col-md-5">
+            <div class="card shadow">
+                <div class="card-body p-5">
+                    <h2 class="text-center fw-bold mb-4">INICIAR SESIÓN</h2>
+                    
+                    {% with messages = get_flashed_messages() %}
+                        {% if messages %}
+                            <div class="alert alert-success">{{ messages[0] }}</div>
+                        {% endif %}
+                    {% endwith %}
+
+                    <form action="/login" method="POST">
+                        <div class="mb-3">
+                            <label class="form-label">Correo Electrónico</label>
+                            <input type="email" name="email" class="form-control" required>
+                        </div>
+                        <div class="mb-4">
+                            <label class="form-label">Contraseña</label>
+                            <input type="password" name="password" class="form-control" required>
+                        </div>
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-primary btn-lg">ENTRAR</button>
+                        </div>
+                    </form>
+                    <div class="text-center mt-3">
+                        <a href="#" class="text-muted">¿Olvidaste tu contraseña?</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+--- FIN DE ARCHIVO: templates\login.html ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\notificaciones.html ---
+----------------------------------------
+{% extends "base.html" %}
+{% block title %}Notificaciones - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container">
+    <div class="row justify-content-center">
+        <div class="col-md-8">
+            <h2 class="fw-bold mb-4">Notificaciones</h2>
+
+            {% with msgs = get_flashed_messages() %}
+                {% if msgs %}<div class="alert alert-info shadow-sm">{{ msgs[0] }}</div>{% endif %}
+            {% endwith %}
+
+            <div class="list-group shadow-sm border-0">
+                {% for n in notificaciones %}
+                    <div class="list-group-item p-4 mb-2 border-0 rounded shadow-sm bg-white">
+                        <div class="d-flex justify-content-between align-items-start">
+                            <div>
+                                <span class="badge {% if n[3] == 'no-leida' %}bg-primary{% else %}bg-secondary{% endif %} mb-2">
+                                    {{ n[1]|upper }}
+                                </span>
+                                <p class="mb-1 fw-bold">{{ n[2] }}</p>
+                                <small class="text-muted">{{ n[0].strftime('%d/%m/%Y %H:%M') }}</small>
+                            </div>
+                            
+                            {% if n[1] == 'solicitud Relacion' and n[4] %}
+                            <div class="mt-3 mt-lg-0">
+                                <a href="/responder_solicitud/{{ n[4] }}/{{ n[5] }}/aceptar" class="btn btn-sm btn-success px-3 me-2">Aceptar</a>
+                                <a href="/responder_solicitud/{{ n[4] }}/{{ n[5] }}/rechazar" class="btn btn-sm btn-outline-danger px-3">Declinar</a>
+                            </div>
+                            {% endif %}
+                        </div>
+                    </div>
+                {% else %}
+                    <div class="text-center py-5 bg-white rounded shadow-sm">
+                        <i class="bi bi-chat-dots display-1 text-muted"></i>
+                        <p class="mt-3 text-muted">No tienes notificaciones por ahora.</p>
+                    </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+--- FIN DE ARCHIVO: templates\notificaciones.html ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\perfil.html ---
+----------------------------------------
+{% extends "base.html" %}
+{% block title %}{{ datos[1] }} {{ datos[2] }} - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-md-4">
+            <div class="card shadow-sm border-0 text-center p-4 mb-4">
+                <div class="bg-primary rounded-circle mx-auto mb-3 d-flex justify-content-center align-items-center text-white display-4" style="width: 100px; height: 100px;">
+                    {{ datos[1][0] }}{{ datos[2][0] }}
+                </div>
+                <h3 class="fw-bold mb-0 text-dark">{{ datos[1] }} {{ datos[2] }}</h3>
+                <p class="text-muted mb-3">{{ datos[3] if datos[3] else 'Ucabista' }}</p>
+                
+                <div class="d-grid gap-2">
+                    {% if es_mio %}
+                        <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#editModal">
+                            <i class="bi bi-pencil-fill me-2"></i>Editar Perfil
+                        </button>
+                    {% else %}
+                        
+                        {% if relaciones.get('seguimiento') == 'aceptada' %}
+                            <a href="/remove_relation/{{ id_obj }}/seguimiento" class="btn btn-success btn-sm shadow-sm"><i class="bi bi-check-lg"></i> Siguiendo</a>
+                        {% else %}
+                            <a href="/add_relation/{{ id_obj }}/seguimiento" class="btn btn-outline-primary btn-sm shadow-sm">Seguir</a>
+                        {% endif %}
+
+                        {% if relaciones.get('amistad') == 'aceptada' %}
+                            <div class="btn-group w-100">
+                                <button class="btn btn-primary btn-sm disabled"><i class="bi bi-people-fill"></i> Amigos</button>
+                                <a href="/remove_relation/{{ id_obj }}/amistad" class="btn btn-outline-danger btn-sm" title="Eliminar Amistad"><i class="bi bi-x-lg"></i></a>
+                            </div>
+                        {% elif relaciones.get('amistad') == 'pendiente' %}
+                            <a href="/cancel_request/{{ id_obj }}/amistad" class="btn btn-secondary btn-sm">Solicitud Enviada (Cancelar)</a>
+                        {% else %}
+                            <a href="/add_relation/{{ id_obj }}/amistad" class="btn btn-outline-dark btn-sm"><i class="bi bi-person-plus"></i> Conectar</a>
+                        {% endif %}
+
+                        {% if nexo and ('Profesor' in nexo[0] or 'Egresado' in nexo[0]) %}
+                            {% if relaciones.get('tutoria') == 'aceptada' %}
+                                <span class="badge bg-warning text-dark border p-2">Es tu Tutor</span>
+                            {% elif relaciones.get('tutoria') == 'pendiente' %}
+                                <button class="btn btn-warning btn-sm disabled">Solicitud Tutoría Pendiente</button>
+                            {% else %}
+                                <a href="/add_relation/{{ id_obj }}/tutoria" class="btn btn-outline-warning text-dark btn-sm">Solicitar Tutoría</a>
+                            {% endif %}
+                        {% endif %}
+
+                    {% endif %}
+                </div>
+            </div>
+
+            <div class="card shadow-sm border-0 p-3">
+                <h6 class="fw-bold mb-3"><i class="bi bi-code-slash me-2"></i>Habilidades Técnicas</h6>
+                <div class="d-flex flex-wrap gap-2">
+                    {% for h in mis_habs %}<span class="badge bg-primary-subtle text-primary border border-primary-subtle px-3">{{ h }}</span>{% else %}<small class="text-muted">Sin habilidades.</small>{% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-8">
+            <div class="card shadow-sm border-0 mb-4">
+                <div class="card-header bg-white fw-bold border-0 pt-3">Información del Miembro</div>
+                <div class="card-body">
+                    <div class="row mb-2 small"><div class="col-4 text-muted">CI:</div><div class="col-8 fw-bold">{{ datos[0] }}</div></div>
+                    <div class="row mb-2 small"><div class="col-4 text-muted">Correo:</div><div class="col-8">{{ datos[5] }}</div></div>
+                    <div class="row mb-2 small"><div class="col-4 text-muted">Ubicación:</div><div class="col-8">{{ datos[6] }}</div></div>
+                    <div class="row mb-0 small"><div class="col-4 text-muted">Dirección:</div><div class="col-8 text-truncate">{{ datos[8] }}</div></div>
+                </div>
+            </div>
+            {% if nexo %}<div class="card shadow-sm border-0"><div class="card-header bg-white fw-bold border-0 pt-3 text-primary">Nexo Institucional</div><div class="card-body"><h6>{{ nexo[1] }}</h6><p class="mb-0 small text-secondary">{{ nexo[0] }}</p><small class="text-muted">Desde: {{ nexo[2].strftime('%B %Y') }}</small></div></div>{% endif %}
+        </div>
+    </div>
+</div>
+
+{% if es_mio %}
+<div class="modal fade" id="editModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-primary text-white">
+                <h5 class="modal-title fw-bold">Editar mi Información</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <form action="/edit_perfil" method="POST">
+                <div class="modal-body">
+                    <h6 class="text-primary border-bottom pb-2 mb-3">Datos Personales</h6>
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold">Nombre</label>
+                            <input type="text" name="nombre" class="form-control" value="{{ datos[1] }}" required>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold">Apellido</label>
+                            <input type="text" name="apellido" class="form-control" value="{{ datos[2] }}" required>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-bold">Ocupación / Cargo</label>
+                        <input type="text" name="ocupacion" class="form-control" value="{{ datos[3] if datos[3] }}">
+                    </div>
+
+                    <h6 class="text-primary border-bottom pb-2 mb-3 mt-4">Ubicación</h6>
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold">Estado</label>
+                            <input type="text" name="estado" class="form-control" value="{{ datos[7] }}" required>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold">Ciudad</label>
+                            <input type="text" name="ciudad" class="form-control" value="{{ datos[6] }}" required>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-bold">Dirección Detallada</label>
+                        <textarea name="direccion" class="form-control" rows="2">{{ datos[8] }}</textarea>
+                    </div>
+
+                    <h6 class="text-primary border-bottom pb-2 mb-3 mt-4">Habilidades Técnicas</h6>
+                    <div class="row">
+                        {% for cat in cat_habs %}
+                        <div class="col-md-4 mb-2">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" name="habilidades" value="{{ cat[0] }}" id="hab_{{ loop.index }}"
+                                    {% if cat[0] in mis_habs %}checked{% endif %}>
+                                <label class="form-check-label" for="hab_{{ loop.index }}">
+                                    {{ cat[0] }}
+                                </label>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-primary fw-bold">Guardar Cambios</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endif %}
+{% endblock %}
+--- FIN DE ARCHIVO: templates\perfil.html ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\register.html ---
+----------------------------------------
+{% extends "base.html" %}
+{% block title %}Registro - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-5 mb-5">
+    <div class="row justify-content-center">
+        <div class="col-md-8 col-lg-6">
+            <div class="card shadow">
+                <div class="card-body p-5">
+                    
+                    <h2 class="text-center fw-bold text-primary mb-4">REGISTRARSE</h2>
+                    <p class="text-center text-muted mb-4">Únete a la comunidad global UCAB</p>
+
+                    {% with messages = get_flashed_messages() %}
+                        {% if messages %}
+                            <div class="alert alert-warning alert-dismissible fade show" role="alert">
+                                {{ messages[0] }}
+                                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                            </div>
+                        {% endif %}
+                    {% endwith %}
+
+                    <form action="/register" method="POST">
+                        
+                        <h5 class="text-secondary border-bottom pb-2 mb-3">Datos de Cuenta</h5>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Correo Electrónico</label>
+                            <input type="email" name="email" class="form-control" placeholder="usuario@correo.com" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Contraseña</label>
+                            <input type="password" name="password" class="form-control" placeholder="******" required>
+                        </div>
+
+                        <h5 class="text-secondary border-bottom pb-2 mb-3 mt-4">Datos Personales</h5>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Cédula de Identidad</label>
+                            <input type="number" name="ci" class="form-control" placeholder="Ej: 28123456" required>
+                        </div>
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label fw-bold">Nombre</label>
+                                <input type="text" name="nombre" class="form-control" placeholder="Ej: Juan" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label fw-bold">Apellido</label>
+                                <input type="text" name="apellido" class="form-control" placeholder="Ej: Pérez" required>
+                            </div>
+                        </div>
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label fw-bold">Fecha de Nacimiento</label>
+                                <input type="date" name="fecha_nac" class="form-control" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label fw-bold">Sexo</label>
+                                <select name="sexo" class="form-select" required>
+                                    <option value="" selected disabled>Seleccione...</option>
+                                    <option value="M">Masculino</option>
+                                    <option value="F">Femenino</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <h5 class="text-secondary border-bottom pb-2 mb-3 mt-4">Ubicación y Contacto</h5>
+                        <div class="row">
+                            <div class="col-md-4 mb-3">
+                                <label class="form-label fw-bold">País</label>
+                                <input type="text" name="pais" class="form-control" placeholder="Ej: España" required>
+                            </div>
+                            <div class="col-md-4 mb-3">
+                                <label class="form-label fw-bold">Estado/Provincia</label>
+                                <input type="text" name="estado" class="form-control" placeholder="Ej: Madrid" required>
+                            </div>
+                            <div class="col-md-4 mb-3">
+                                <label class="form-label fw-bold">Ciudad</label>
+                                <input type="text" name="ciudad" class="form-control" placeholder="Ej: Madrid" required>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Dirección Detallada</label>
+                            <textarea name="direccion" class="form-control" rows="2" placeholder="Av. Principal, Edificio A, Apto 1..." required></textarea>
+                        </div>
+
+                        <h5 class="text-secondary border-bottom pb-2 mb-3 mt-4">Vinculación UCAB</h5>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Rol Principal</label>
+                            <select name="rol_ucab" class="form-select" required>
+                                <option value="" selected disabled>¿Qué eres en la universidad?</option>
+                                <option value="estudiante">Estudiante</option>
+                                <option value="profesor">Profesor</option>
+                                <option value="egresado">Egresado</option>
+                                <option value="empleado">Empleado</option>
+                            </select>
+                        </div>
+                        <div class="mb-4">
+                            <label class="form-label fw-bold">Escuela o Dependencia</label>
+                            <select name="escuela" class="form-select" required>
+                                <option value="100">Ingeniería Informática</option>
+                                <option value="101">Ingeniería Civil</option>
+                                <option value="102">Comunicación Social</option>
+                                <option value="200">Secretaría</option>
+                            </select>
+                        </div>
+
+                        <div class="d-grid gap-2 mt-5">
+                            <button type="submit" class="btn btn-primary btn-lg fw-bold">COMPLETAR REGISTRO</button>
+                        </div>
+
+                    </form>
+
+                    <div class="text-center mt-4">
+                        <p class="mb-0">¿Ya tienes cuenta? <a href="/login" class="text-decoration-none fw-bold">Iniciar Sesión</a></p>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+--- FIN DE ARCHIVO: templates\register.html ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\register_entity.html ---
+----------------------------------------
+{% extends "base.html" %}
+{% block title %}Registro Institucional - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-5 mb-5">
+    <div class="row justify-content-center">
+        <div class="col-md-8">
+            <div class="card shadow border-0">
+                <div class="card-header bg-dark text-white text-center py-4">
+                    <h3 class="fw-bold mb-0">Registro Institucional</h3>
+                    <p class="mb-0 small opacity-75">Para Escuelas, Facultades y Organizaciones Aliadas</p>
+                </div>
+                <div class="card-body p-5">
+
+                    {% with messages = get_flashed_messages() %}
+                        {% if messages %}<div class="alert alert-warning">{{ messages[0] }}</div>{% endif %}
+                    {% endwith %}
+
+                    <form action="/register_entity" method="POST">
+                        
+                        <div class="mb-4 text-center">
+                            <label class="form-label fw-bold d-block">¿Qué tipo de entidad deseas registrar?</label>
+                            <div class="btn-group" role="group">
+                                <input type="radio" class="btn-check" name="tipo_ente" id="opt_dep" value="Dependencia" checked onclick="toggleForm('dep')">
+                                <label class="btn btn-outline-primary" for="opt_dep">Dependencia UCAB</label>
+
+                                <input type="radio" class="btn-check" name="tipo_ente" id="opt_org" value="Organizacion" onclick="toggleForm('org')">
+                                <label class="btn btn-outline-primary" for="opt_org">Organización Externa</label>
+                            </div>
+                        </div>
+
+                        <h6 class="text-primary border-bottom pb-2 mb-3">Datos de Acceso</h6>
+                        <div class="row g-3 mb-3">
+                            <div class="col-md-6">
+                                <label class="form-label fw-bold">Correo Institucional</label>
+                                <input type="email" name="email" class="form-control" placeholder="ej: ingenieria@ucab.edu.ve" required>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label fw-bold">Contraseña</label>
+                                <input type="password" name="password" class="form-control" placeholder="******" required>
+                            </div>
+                        </div>
+
+                        <div id="form_dependencia">
+                            <h6 class="text-primary border-bottom pb-2 mb-3 mt-4">Datos de la Dependencia</h6>
+                            <div class="mb-3">
+                                <label class="form-label fw-bold">Nombre Oficial</label>
+                                <input type="text" name="nombre" class="form-control" placeholder="Ej: Escuela de Ingeniería Informática">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label fw-bold">Tipo</label>
+                                <select name="tipo_dep" class="form-select">
+                                    <option value="Escuela">Escuela</option>
+                                    <option value="Facultad">Facultad</option>
+                                    <option value="CentroInvestigacion">Centro de Investigación</option>
+                                    <option value="Agrupacion">Agrupación Estudiantil</option>
+                                    <option value="Secretariado">Secretariado</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div id="form_organizacion" style="display: none;">
+                            <h6 class="text-primary border-bottom pb-2 mb-3 mt-4">Datos de la Organización</h6>
+                            <div class="row g-3 mb-3">
+                                <div class="col-md-8">
+                                    <label class="form-label fw-bold">Razón Social</label>
+                                    <input type="text" id="input_nombre_org" name="nombre" class="form-control" placeholder="Ej: Empresas Polar C.A." disabled>
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label fw-bold">RIF</label>
+                                    <input type="text" name="rif" class="form-control" placeholder="J-12345678-9">
+                                </div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label fw-bold">Tipo</label>
+                                <select name="tipo_org" class="form-select">
+                                    <option value="Empresa">Empresa</option>
+                                    <option value="Fundacion">Fundación</option>
+                                    <option value="Asociacion">Asociación Civil</option>
+                                    <option value="Catedra">Cátedra Empresarial</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <h6 class="text-primary border-bottom pb-2 mb-3 mt-4">Ubicación</h6>
+                        <div class="row g-3 mb-3">
+                            <div class="col-md-4">
+                                <input type="text" name="pais" class="form-control" placeholder="País" value="Venezuela" required>
+                            </div>
+                            <div class="col-md-4">
+                                <input type="text" name="estado" class="form-control" placeholder="Estado" required>
+                            </div>
+                            <div class="col-md-4">
+                                <input type="text" name="ciudad" class="form-control" placeholder="Ciudad" required>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <textarea name="direccion" class="form-control" rows="2" placeholder="Dirección detallada (Edificio, Piso, Oficina)..." required></textarea>
+                        </div>
+                        <div class="mb-4">
+                            <label class="form-label fw-bold">Descripción / Misión</label>
+                            <textarea name="descripcion" class="form-control" rows="3" placeholder="Breve descripción de la entidad..."></textarea>
+                        </div>
+
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-dark btn-lg fw-bold">CREAR CUENTA INSTITUCIONAL</button>
+                        </div>
+                    </form>
+
+                </div>
+            </div>
+            <div class="text-center mt-3">
+                <a href="/login" class="text-decoration-none">Volver al Login</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    function toggleForm(tipo) {
+        const fDep = document.getElementById('form_dependencia');
+        const fOrg = document.getElementById('form_organizacion');
+        const inputNombreDep = document.querySelector('#form_dependencia input[name="nombre"]');
+        const inputNombreOrg = document.getElementById('input_nombre_org');
+
+        if (tipo === 'dep') {
+            fDep.style.display = 'block';
+            fOrg.style.display = 'none';
+            inputNombreDep.disabled = false;
+            inputNombreOrg.disabled = true; // Deshabilitar para evitar conflicto de nombres
+        } else {
+            fDep.style.display = 'none';
+            fOrg.style.display = 'block';
+            inputNombreDep.disabled = true; 
+            inputNombreOrg.disabled = false;
+        }
+    }
+</script>
+{% endblock %}
+--- FIN DE ARCHIVO: templates\register_entity.html ---
+============================================================
+
+--- INICIO DE ARCHIVO: templates\usuarios.html ---
+----------------------------------------
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+    <h2 class="fw-bold mb-4">Explorar Comunidad</h2>
+    
+    <div class="card p-3 mb-4 bg-light border-0 shadow-sm">
+        <form class="row g-3" method="GET" action="/usuarios">
+            <div class="col-md-4">
+                <input type="text" name="q" class="form-control" placeholder="Nombre..." value="{{ q }}">
+            </div>
+            <div class="col-md-3">
+                <input type="text" name="ciudad" class="form-control" placeholder="Ciudad..." value="{{ ciudad }}">
+            </div>
+            <div class="col-md-3">
+                <select name="ocupacion" class="form-select">
+                    <option value="">Todas las ocupaciones</option>
+                    {% for ocu_item in lista_ocupaciones %}
+                        <option value="{{ ocu_item }}" {% if ocupacion == ocu_item %}selected{% endif %}>{{ ocu_item }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-2">
+                <button type="submit" class="btn btn-primary w-100">Filtrar</button>
+            </div>
+        </form>
+    </div>
+    <div class="card shadow-sm border-0">
+        <table class="table table-hover mb-0 align-middle">
+            <thead class="table-light"><tr><th>Miembro</th><th>Ocupación</th><th>Ciudad</th><th class="text-end">Acciones</th></tr></thead>
+            <tbody>
+                {% for u in usuarios %}
+                <tr>
+                    <td>
+                        <div class="d-flex align-items-center">
+                            <div class="bg-primary-subtle rounded-circle me-3 d-flex justify-content-center align-items-center fw-bold text-primary" style="width: 40px; height: 40px;">{{ u[1][0] }}{{ u[2][0] }}</div>
+                            <div><div class="fw-bold">{{ u[1] }} {{ u[2] }}</div></div>
+                        </div>
+                    </td>
+                    <td>{{ u[3] if u[3] else '-' }}</td>
+                    <td>{{ u[5] }}</td>
+                    <td class="text-end">
+                        <a href="/perfil/{{ u[0] }}" class="btn btn-sm btn-outline-secondary me-2">Perfil</a>
+                        {% if u[4] %}<button class="btn btn-sm btn-success disabled">Siguiendo</button>
+                        {% else %}<a href="/add_relation/{{ u[0] }}/seguimiento" class="btn btn-sm btn-primary">Seguir</a>{% endif %}
+                    </td>
+                </tr>
+                {% else %}
+                <tr><td colspan="4" class="text-center py-4 text-muted">No hay resultados.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+--- FIN DE ARCHIVO: templates\usuarios.html ---
+============================================================

@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% block title %}{{ datos[1] }} {{ datos[2] }} - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-md-4">
+            <div class="card shadow-sm border-0 text-center p-4 mb-4">
+                <div class="bg-primary rounded-circle mx-auto mb-3 d-flex justify-content-center align-items-center text-white display-4" style="width: 100px; height: 100px;">
+                    {{ datos[1][0] }}{{ datos[2][0] }}
+                </div>
+                <h3 class="fw-bold mb-0 text-dark">{{ datos[1] }} {{ datos[2] }}</h3>
+                <p class="text-muted mb-2">{{ datos[3] if datos[3] else 'Ucabista' }}</p>
+                
+                {% if es_mio %}
+                    <span class="badge bg-secondary mb-3"><i class="bi bi-eye"></i> Perfil {{ datos[10]|title }}</span>
+                {% endif %}
+
+                <div class="d-grid gap-2 mt-2">
+                    {% if es_mio %}
+                        <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#editModal">
+                            <i class="bi bi-pencil-fill me-2"></i>Editar Perfil
+                        </button>
+                    {% else %}
+                        
+                        {% if relaciones.get('seguimiento') == 'aceptada' %}
+                            <a href="/remove_relation/{{ id_obj }}/seguimiento" class="btn btn-success btn-sm shadow-sm"><i class="bi bi-check-lg"></i> Siguiendo</a>
+                        {% else %}
+                            <a href="/add_relation/{{ id_obj }}/seguimiento" class="btn btn-outline-primary btn-sm shadow-sm">Seguir</a>
+                        {% endif %}
+
+                        {% if relaciones.get('amistad') == 'aceptada' %}
+                            <div class="btn-group w-100">
+                                <button class="btn btn-primary btn-sm disabled"><i class="bi bi-people-fill"></i> Amigos</button>
+                                <a href="/remove_relation/{{ id_obj }}/amistad" class="btn btn-outline-danger btn-sm" title="Eliminar Amistad"><i class="bi bi-x-lg"></i></a>
+                            </div>
+                        {% elif relaciones.get('amistad') == 'pendiente' %}
+                            <a href="/cancel_request/{{ id_obj }}/amistad" class="btn btn-secondary btn-sm">Solicitud Enviada (Cancelar)</a>
+                        {% else %}
+                            <a href="/add_relation/{{ id_obj }}/amistad" class="btn btn-outline-dark btn-sm"><i class="bi bi-person-plus"></i> Conectar</a>
+                        {% endif %}
+
+                        {% if 'Profesor' in roles_usuario or 'Egresado' in roles_usuario %}
+                            {% if relaciones.get('tutoria') == 'aceptada' %}
+                                <span class="badge bg-warning text-dark border p-2">Es tu Tutor</span>
+                            {% elif relaciones.get('tutoria') == 'pendiente' %}
+                                <button class="btn btn-warning btn-sm disabled">Solicitud Tutoría Pendiente</button>
+                            {% else %}
+                                <a href="/add_relation/{{ id_obj }}/tutoria" class="btn btn-outline-warning text-dark btn-sm">Solicitar Tutoría</a>
+                            {% endif %}
+                        {% endif %}
+
+                    {% endif %}
+                </div>
+            </div>
+
+            {% if not es_mio and camino_conexion %}
+            <div class="card shadow-sm border-0 p-3 mb-4 bg-info-subtle">
+                <h6 class="fw-bold text-info-emphasis mb-2"><i class="bi bi-diagram-3-fill me-2"></i>Conexión Social</h6>
+                <small class="d-block text-dark">{{ camino_conexion }}</small>
+            </div>
+            {% endif %}
+
+            <div class="card shadow-sm border-0 p-3">
+                <h6 class="fw-bold mb-3"><i class="bi bi-code-slash me-2"></i>Habilidades Técnicas</h6>
+                <div class="d-flex flex-wrap gap-2">
+                    {% for h in mis_habs %}<span class="badge bg-primary-subtle text-primary border border-primary-subtle px-3">{{ h }}</span>{% else %}<small class="text-muted">Sin habilidades.</small>{% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-8">
+            <div class="card shadow-sm border-0 mb-4">
+                <div class="card-header bg-white fw-bold border-0 pt-3 d-flex justify-content-between">
+                    <span>Información de Contacto</span>
+                    {% if not mostrar_sensible %}
+                        <span class="badge bg-danger"><i class="bi bi-lock-fill"></i> Privado</span>
+                    {% endif %}
+                </div>
+                <div class="card-body">
+                    <div class="row mb-2 small"><div class="col-4 text-muted">CI:</div><div class="col-8 fw-bold">{{ datos[0] }}</div></div>
+                    
+                    {% if mostrar_sensible %}
+                        <div class="row mb-2 small"><div class="col-4 text-muted">Correo:</div><div class="col-8">{{ datos[5] }}</div></div>
+                        <div class="row mb-2 small"><div class="col-4 text-muted">Teléfono:</div><div class="col-8">{{ datos[11] if datos[11] else 'No registrado' }}</div></div>
+                        <div class="row mb-2 small"><div class="col-4 text-muted">Ubicación:</div><div class="col-8">{{ datos[6] }}, {{ datos[7] }}</div></div>
+                        <div class="row mb-0 small"><div class="col-4 text-muted">Dirección:</div><div class="col-8 text-truncate">{{ datos[8] }}</div></div>
+                    {% else %}
+                        <div class="alert alert-light border text-center text-muted small mt-2">
+                            <i class="bi bi-eye-slash-fill mb-2 fs-4 d-block"></i>
+                            La información de contacto es privada.
+                            <br>Conecta con {{ datos[1] }} para ver más detalles.
+                        </div>
+                    {% endif %}
+                </div>
+            </div>
+            
+            {% if nexo %}
+            <div class="card shadow-sm border-0">
+                <div class="card-header bg-white fw-bold border-0 pt-3 text-primary">Nexo Institucional Principal</div>
+                <div class="card-body">
+                    <h6>{{ nexo[1] }}</h6>
+                    <p class="mb-0 small text-secondary">{{ nexo[0] }}</p>
+                    <small class="text-muted">Desde: {{ nexo[2].strftime('%B %Y') }}</small>
+                </div>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+{% if es_mio %}
+<div class="modal fade" id="editModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-primary text-white">
+                <h5 class="modal-title fw-bold">Editar mi Información</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <form action="/edit_perfil" method="POST">
+                <div class="modal-body">
+                    
+                    <div class="alert alert-secondary d-flex align-items-center mb-4">
+                        <i class="bi bi-shield-lock-fill fs-3 me-3"></i>
+                        <div class="flex-grow-1">
+                            <label class="fw-bold mb-1">Visibilidad del Perfil</label>
+                            <select name="visibilidad" class="form-select form-select-sm">
+                                <option value="publica" {% if datos[10] == 'publica' %}selected{% endif %}>🌍 Pública (Todos pueden ver contacto)</option>
+                                <option value="solo-amigos" {% if datos[10] == 'solo-amigos' %}selected{% endif %}>👥 Solo Amigos (Oculto a desconocidos)</option>
+                                <option value="privada" {% if datos[10] == 'privada' %}selected{% endif %}>🔒 Privada (Solo yo)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <h6 class="text-primary border-bottom pb-2 mb-3">Datos Personales</h6>
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold">Nombre</label>
+                            <input type="text" name="nombre" class="form-control" value="{{ datos[1] }}" required>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold">Apellido</label>
+                            <input type="text" name="apellido" class="form-control" value="{{ datos[2] }}" required>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-bold">Ocupación / Cargo</label>
+                        <input type="text" name="ocupacion" class="form-control" value="{{ datos[3] if datos[3] }}">
+                    </div>
+
+                    <h6 class="text-primary border-bottom pb-2 mb-3 mt-4">Ubicación</h6>
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold">Estado</label>
+                            <input type="text" name="estado" class="form-control" value="{{ datos[7] }}" required>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold">Ciudad</label>
+                            <input type="text" name="ciudad" class="form-control" value="{{ datos[6] }}" required>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-bold">Dirección Detallada</label>
+                        <textarea name="direccion" class="form-control" rows="2">{{ datos[8] }}</textarea>
+                    </div>
+
+                    <h6 class="text-primary border-bottom pb-2 mb-3 mt-4">Habilidades Técnicas</h6>
+                    <div class="row">
+                        {% for cat in cat_habs %}
+                        <div class="col-md-4 mb-2">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" name="habilidades" value="{{ cat[0] }}" id="hab_{{ loop.index }}"
+                                {% if cat[0] in mis_habs %}checked{% endif %}>
+                                <label class="form-check-label" for="hab_{{ loop.index }}">
+                                    {{ cat[0] }}
+                                </label>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-primary fw-bold">Guardar Cambios</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endif %}
+{% endblock %}

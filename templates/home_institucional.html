@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}Panel Institucional - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <div class="card shadow-sm border-0 mb-4 bg-dark text-white">
+        <div class="card-body p-4 d-flex justify-content-between align-items-center">
+            <div>
+                <h6 class="text-uppercase text-info mb-1">{{ datos[1] }}</h6>
+                <h2 class="fw-bold mb-0">{{ datos[0] }}</h2>
+                <small class="opacity-75"><i class="bi bi-geo-alt"></i> {{ datos[2] }}</small>
+            </div>
+            <div class="text-end">
+                <button class="btn btn-info fw-bold text-dark" data-bs-toggle="modal" data-bs-target="#modalEvento">
+                    <i class="bi bi-plus-circle me-2"></i>Nuevo Evento
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div class="card shadow-sm border-0">
+        <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center">
+            <h5 class="fw-bold mb-0 text-primary">📅 Historial de Publicaciones</h5>
+            <small class="text-muted">Estos son los eventos creados por tu dependencia</small>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th style="width: 40%;">Evento</th>
+                        <th>Fecha</th>
+                        <th>Lugar</th>
+                        <th class="text-center">Inscritos</th>
+                        <th class="text-center">Estado</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for e in eventos %}
+                    <tr>
+                        <td>
+                            <div class="fw-bold">{{ e[1] }}</div>
+                            <small class="text-muted">{{ e[2].strftime('%d/%m/%Y') }}</small>
+                        </td>
+                        <td>{{ e[2].strftime('%H:%M') }}</td>
+                        <td>{{ e[3] }}</td>
+                        <td class="text-center">
+                            <span class="badge bg-light text-dark border">{{ e[5] }}</span>
+                        </td>
+                        <td class="text-center">
+                            {% if e[4] == 'publicado' %}
+                                <span class="badge bg-success"><i class="bi bi-check-circle"></i> Público</span>
+                            {% elif e[4] == 'finalizado' %}
+                                <span class="badge bg-secondary">Finalizado</span>
+                            {% else %}
+                                <span class="badge bg-warning text-dark"><i class="bi bi-cone-striped"></i> {{ e[4]|title }}</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="5" class="text-center py-5 text-muted bg-light">
+                            <i class="bi bi-calendar-x display-4 d-block mb-3 opacity-50"></i>
+                            No has publicado eventos todavía.
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="modalEvento" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header bg-info">
+                <h5 class="modal-title fw-bold text-dark">Publicar Evento Oficial</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form action="/crear_evento_oficial" method="POST">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="fw-bold">Nombre del Evento</label>
+                        <input type="text" name="nombre" class="form-control" required>
+                    </div>
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <label class="fw-bold">Tipo</label>
+                            <select name="tipo" class="form-select">
+                                <option value="conferencia">Conferencia</option>
+                                <option value="taller">Taller</option>
+                                <option value="webinar">Webinar</option>
+                                <option value="acto-grado">Acto de Grado</option>
+                            </select>
+                        </div>
+                        <div class="col-6">
+                            <label class="fw-bold">Fecha y Hora</label>
+                            <input type="datetime-local" name="fecha" class="form-control" required>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="fw-bold">Lugar / Enlace</label>
+                        <input type="text" name="lugar" class="form-control" placeholder="Ej: Auditorio Hermano Lanz" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="fw-bold">Descripción</label>
+                        <textarea name="desc" class="form-control" rows="3"></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-info fw-bold text-dark">Publicar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}

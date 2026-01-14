@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}Auditoría - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-5">
+    <div class="text-center mb-5">
+        <h2 class="fw-bold text-secondary"><i class="bi bi-shield-lock-fill"></i> Panel de Auditoría</h2>
+        <p class="text-muted">Vista de solo lectura sobre estadísticas globales del sistema.</p>
+    </div>
+
+    <div class="row justify-content-center g-4 mb-4">
+        <div class="col-md-3">
+            <div class="card text-center shadow-sm border-0 h-100 py-4 border-bottom border-primary border-4">
+                <div class="card-body">
+                    <h1 class="display-4 fw-bold text-primary mb-0">{{ stats[0] }}</h1>
+                    <p class="text-muted fw-bold small text-uppercase mt-2">Usuarios Registrados</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card text-center shadow-sm border-0 h-100 py-4 border-bottom border-success border-4">
+                <div class="card-body">
+                    <h1 class="display-4 fw-bold text-success mb-0">{{ stats[1] }}</h1>
+                    <p class="text-muted fw-bold small text-uppercase mt-2">Grupos Totales</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card text-center shadow-sm border-0 h-100 py-4 border-bottom border-info border-4">
+                <div class="card-body">
+                    <h1 class="display-4 fw-bold text-info mb-0">{{ stats[4] }}</h1>
+                    <p class="text-muted fw-bold small text-uppercase mt-2">Empresas Aliadas</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row justify-content-center g-4">
+        <div class="col-md-3">
+            <div class="card text-center shadow-sm border-0 h-100 py-3">
+                <div class="card-body">
+                    <h2 class="fw-bold text-warning mb-0">{{ stats[2] }}</h2>
+                    <p class="text-muted small text-uppercase">Eventos Activos</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card text-center shadow-sm border-0 h-100 py-3">
+                <div class="card-body">
+                    <h2 class="fw-bold text-secondary mb-0">{{ stats[3] }}</h2>
+                    <p class="text-muted small text-uppercase">Eventos Finalizados</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card text-center shadow-sm border-0 h-100 py-3">
+                <div class="card-body">
+                    <h2 class="fw-bold text-dark mb-0">{{ stats[5] }}</h2>
+                    <p class="text-muted small text-uppercase">Publicaciones (Posts)</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card text-center shadow-sm border-0 h-100 py-3">
+                <div class="card-body">
+                    <h2 class="fw-bold text-dark mb-0">{{ stats[6] }}</h2>
+                    <p class="text-muted small text-uppercase">Comentarios</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="alert alert-secondary mt-5 text-center shadow-sm mx-auto" style="max-width: 800px;">
+        <i class="bi bi-info-circle-fill me-2"></i>
+        <strong>Modo Solo Lectura:</strong> Datos extraídos de la vista <code>vw_estadisticas_anonimas</code>.
+    </div>
+</div>
+{% endblock %}

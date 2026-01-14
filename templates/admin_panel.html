@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% block title %}Superusuario - SoyUCAB{% endblock %}
+{% block content %}
+<div class="container mt-4 mb-5">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h2 class="fw-bold text-danger"><i class="bi bi-database-fill-gear me-2"></i>Panel de Administración</h2>
+            <p class="text-muted mb-0">Gestión total del sistema (Rol: Superusuario)</p>
+        </div>
+        <div class="card bg-danger text-white px-3 py-2">
+            <small class="fw-bold"><i class="bi bi-exclamation-triangle-fill"></i> ZONA DE PELIGRO</small>
+        </div>
+    </div>
+
+    <ul class="nav nav-tabs mb-3" id="adminTabs" role="tablist">
+        <li class="nav-item"><button class="nav-link active fw-bold text-dark" data-bs-toggle="tab" data-bs-target="#users">👤 Usuarios</button></li>
+        <li class="nav-item"><button class="nav-link fw-bold text-dark" data-bs-toggle="tab" data-bs-target="#groups">👥 Grupos</button></li>
+        <li class="nav-item"><button class="nav-link fw-bold text-dark" data-bs-toggle="tab" data-bs-target="#events">📅 Eventos</button></li>
+    </ul>
+
+    <div class="tab-content">
+        
+        <div class="tab-pane fade show active" id="users">
+            <div class="card shadow border-0">
+                <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0">Usuarios Registrados</h5>
+                    <span class="badge bg-light text-dark">{{ usuarios|length }}</span>
+                </div>
+                <div class="table-responsive" style="max-height: 500px; overflow-y: auto;">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead class="table-light sticky-top">
+                            <tr>
+                                <th>ID</th>
+                                <th>Tipo</th>
+                                <th>Nombre / Razón Social</th>
+                                <th>Rol / Detalle</th>
+                                <th class="text-center">Estado</th>
+                                <th class="text-end">Acciones</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for u in usuarios %}
+                            <tr>
+                                <td><span class="badge bg-secondary">{{ u[0] }}</span></td>
+                                <td>
+                                    {% if u[1] == 'Persona' %}<i class="bi bi-person text-primary" title="Persona"></i>
+                                    {% elif u[1] == 'Dependencia' %}<i class="bi bi-building text-info" title="Institución"></i>
+                                    {% else %}<i class="bi bi-briefcase text-warning" title="Organización"></i>{% endif %}
+                                </td>
+                                <td class="fw-bold">
+                                    {{ u[3] }}<br>
+                                    <small class="text-muted fw-normal">{{ u[2] }}</small>
+                                </td>
+                                <td><small class="text-muted border px-2 rounded">{{ u[4] }}</small></td>
+                                <td class="text-center">
+                                    {% if u[5] == 'activo' %}<span class="badge bg-success">Activo</span>
+                                    {% else %}<span class="badge bg-danger">Suspendido</span>{% endif %}
+                                </td>
+                                <td class="text-end">
+                                    {% if u[0] != session['user_id'] %}
+                                        <div class="btn-group">
+                                            {% if u[1] == 'Persona' %}
+                                                <a href="/admin/toggle_status/{{ u[0] }}/{{ u[1] }}" class="btn btn-sm {% if u[5] == 'activo' %}btn-outline-warning text-dark{% else %}btn-outline-success{% endif %}" title="Suspender/Activar">
+                                                    {% if u[5] == 'activo' %}<i class="bi bi-pause-circle"></i>{% else %}<i class="bi bi-play-circle"></i>{% endif %}
+                                                </a>
+                                            {% endif %}
+                                            <a href="/admin/delete_user/{{ u[0] }}" class="btn btn-sm btn-outline-danger" onclick="return confirm('⚠️ ¡PELIGRO!\n\nEstás a punto de ELIMINAR PERMANENTEMENTE al usuario {{ u[3] }}.\nSe borrarán todos sus posts, likes, relaciones y datos.\n\n¿Estás seguro?')" title="Eliminar Definitivamente">
+                                                <i class="bi bi-trash-fill"></i>
+                                            </a>
+                                        </div>
+                                    {% else %}
+                                        <small class="text-muted">Tú</small>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-pane fade" id="groups">
+            <div class="card shadow border-0">
+                <div class="card-header bg-secondary text-white">
+                    <h5 class="mb-0">Gestión de Grupos</h5>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle">
+                        <thead><tr><th>ID</th><th>Nombre</th><th>Tipo</th><th>Miembros</th><th class="text-end">Acción</th></tr></thead>
+                        <tbody>
+                            {% for g in grupos %}
+                            <tr>
+                                <td>{{ g[0] }}</td>
+                                <td class="fw-bold">{{ g[1] }}</td>
+                                <td>{{ g[2]|title }}</td>
+                                <td>{{ g[3] }}</td>
+                                <td class="text-end">
+                                    <a href="/admin/delete_group/{{ g[0] }}" class="btn btn-sm btn-danger" onclick="return confirm('¿Borrar el grupo {{ g[1] }}?')"><i class="bi bi-trash"></i> Eliminar</a>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-pane fade" id="events">
+            <div class="card shadow border-0">
+                <div class="card-header bg-secondary text-white">
+                    <h5 class="mb-0">Gestión de Eventos</h5>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle">
+                        <thead><tr><th>ID</th><th>Nombre</th><th>Fecha</th><th>Estado</th><th class="text-end">Acción</th></tr></thead>
+                        <tbody>
+                            {% for e in eventos %}
+                            <tr>
+                                <td>{{ e[0] }}</td>
+                                <td class="fw-bold">{{ e[1] }} <small class="d-block text-muted">{{ e[2]|title }}</small></td>
+                                <td>{{ e[3].strftime('%d/%m/%Y %H:%M') }}</td>
+                                <td><span class="badge bg-light text-dark border">{{ e[4] }}</span></td>
+                                <td class="text-end">
+                                    <a href="/admin/delete_event/{{ e[0] }}" class="btn btn-sm btn-danger" onclick="return confirm('¿Borrar el evento {{ e[1] }}?')"><i class="bi bi-trash"></i> Eliminar</a>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</div>
+{% endblock %}
